@@ -17,8 +17,10 @@ from query_shield import QueryShield, Estado
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────
 DB_CONFIG = {
-    "dbname": "datacorpus_bd", "user": "datacorpus",
-    "password": "730822", "host": "127.0.0.1", "port": 5433
+    "dbname": "datacorpus_bd",
+    "user": "datacorpus",
+    "password": "730822",
+    "host": "localhost"
 }
 
 TOKEN_TOGETHER = "tgp_v1_35Ewiz4u1GT4huetCkSeITDZ9eyw-6tNcuYlSn5X7lY"
