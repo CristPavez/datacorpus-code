@@ -220,6 +220,9 @@ def main():
     # Guardar JSONL final
     with open("queries_validadas.jsonl", 'w', encoding='utf-8') as f:
         for q in todas_las_queries:
+            # Convertir score a float nativo si es numpy.float32 u otro tipo no serializable
+            if "score" in q and hasattr(q["score"], "item"):
+                q["score"] = float(q["score"])
             f.write(json.dumps(q, ensure_ascii=False) + '\n')
 
 
