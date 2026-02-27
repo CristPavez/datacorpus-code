@@ -7,8 +7,10 @@ from data_shield import DataShield, Estado
 from query_shield import QueryShield
 
 DB_CONFIG = {
-    "dbname": "datacorpus_bd", "user": "datacorpus",
-    "password": "730822", "host": "127.0.0.1", "port": 5433
+    "dbname": "datacorpus_bd",
+    "user": "datacorpus",
+    "password": "730822",
+    "host": "localhost"
 }
 
 def log_error_general(mensaje):
