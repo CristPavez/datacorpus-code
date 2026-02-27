@@ -1,0 +1,16 @@
+
+# Core
+psycopg[binary]
+pgvector
+faiss-cpu
+sentence-transformers
+openai
+requests
+beautifulsoup4
+numpy
+trafilatura
+nltk
+
+# Utilidades y dependencias estándar (no requieren instalación):
+# json, uuid, time, tempfile, os, sys, typing, dataclasses, enum, pathlib, pickle
+# urllib.parse, importlib, asyncio, datetime
