@@ -25,7 +25,7 @@ DB_CONFIG = {
 
 TOKEN_TOGETHER = "tgp_v1_35Ewiz4u1GT4huetCkSeITDZ9eyw-6tNcuYlSn5X7lY"
 
-QUERIES_POR_TEMA = 1
+QUERIES_POR_TEMA = 25
 
 TEMAS_VALIDOS = [
     "Medicina", "Legal / Derecho", "Finanzas", "Tecnología", "Educación / Académico",
