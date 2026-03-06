@@ -1,3 +1,14 @@
+import os
+import warnings
+import logging
+
+# Silenciar warnings y barras de progreso de transformers
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
+warnings.filterwarnings('ignore')
+logging.getLogger('transformers').setLevel(logging.ERROR)
+logging.getLogger('sentence_transformers').setLevel(logging.ERROR)
+
 import faiss
 import numpy as np
 import psycopg
@@ -35,7 +46,8 @@ class QueryShield:
     def __init__(self, db_config: dict, faiss_path: str = "faiss_index.bin"):
         self.db_config = db_config
         self.faiss_path = Path(faiss_path)
-        self.model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        self.model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device='cpu')
+        self.model.tokenizer.model_max_length = 512  # Silenciar warnings de longitud
         self.uuid_mapping = []
         self.faiss_index = self._load_or_create_faiss()
         self._sync_pg_faiss()

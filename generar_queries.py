@@ -4,6 +4,17 @@ DataCorpus - Generador y validador de queries por tema.
 Flujo: Selecciona temas → Genera con LLM → Valida con QueryShield → Guarda BD + JSONL
 """
 
+import os
+import warnings
+import logging
+
+# Silenciar warnings y barras de progreso de transformers
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
+warnings.filterwarnings('ignore')
+logging.getLogger('transformers').setLevel(logging.ERROR)
+logging.getLogger('sentence_transformers').setLevel(logging.ERROR)
+
 import json
 import uuid
 import psycopg
@@ -20,7 +31,8 @@ DB_CONFIG = {
     "dbname": "datacorpus_bd",
     "user": "datacorpus",
     "password": "730822",
-    "host": "localhost"
+    "host": "localhost",
+    "port": 5433
 }
 
 TOKEN_TOGETHER = "tgp_v1_35Ewiz4u1GT4huetCkSeITDZ9eyw-6tNcuYlSn5X7lY"
@@ -46,7 +58,8 @@ _embedding_model = None
 def get_embedding_model() -> SentenceTransformer:
     global _embedding_model
     if _embedding_model is None:
-        _embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        _embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device='cpu')
+        _embedding_model.tokenizer.model_max_length = 512  # Silenciar warnings de longitud
     return _embedding_model
 
 def get_llm_client() -> OpenAI:
@@ -83,25 +96,52 @@ def seleccionar_temas() -> List[str]:
 # ─────────────────────────────────────────────
 def generar_preguntas_lm(tema: str, n: int) -> List[str]:
     """Genera n preguntas técnicas sobre el tema usando DeepSeek V3."""
-    prompt = f"""Genera exactamente {n} preguntas únicas y específicas sobre {tema} en español.
-Requisitos:
-- Diversas en enfoque (cómo funciona, ventajas, desventajas, aplicaciones, etc.)
-- Técnicas y específicas, no genéricas
-- Una por línea, sin numeración
-Evita: "¿Qué es {tema}?" o "¿Para qué sirve {tema}?"
-Genera {n} preguntas sobre {tema}:"""
+    
+    prompt_sistema = (
+        "Eres un generador de preguntas técnicas especializadas. "
+        "Tu tarea es crear preguntas específicas, profundas y diversas sobre temas especializados. "
+        "SOLO genera las preguntas, una por línea, sin numeración ni explicaciones adicionales."
+    )
+    
+    prompt_usuario = (
+        f"Genera exactamente {n} preguntas técnicas sobre '{tema}' en español.\n\n"
+        f"Requisitos:\n"
+        f"- Cada pregunta debe ser específica y profunda, no genérica\n"
+        f"- Diversas en enfoque: cómo funciona, ventajas, desventajas, aplicaciones, casos de uso, comparaciones, etc.\n"
+        f"- Evita preguntas obvias como '¿Qué es {tema}?' o '¿Para qué sirve {tema}?'\n"
+        f"- Formato: Una pregunta por línea, sin numeración\n\n"
+        f"Ejemplo de pregunta específica: '¿Cómo impacta el uso de grafeno en la eficiencia térmica de las baterías de iones de litio?'\n\n"
+        f"Genera {n} preguntas sobre {tema}:"
+    )
 
     response = get_llm_client().chat.completions.create(
         model="deepseek-ai/DeepSeek-V3",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": prompt_sistema},
+            {"role": "user", "content": prompt_usuario}
+        ],
         max_tokens=1000,
-        temperature=0.7
+        temperature=0.8
     )
 
-    texto = response.choices[0].message.content
+    texto = response.choices[0].message.content.strip()
+    
+    # Extraer solo las líneas que son preguntas (contienen '?')
     preguntas = [l.strip() for l in texto.split('\n') if l.strip() and '?' in l]
+    
+    # Limpiar numeración si existe (ej: "1. ¿Pregunta?" → "¿Pregunta?")
     preguntas = [p.split('. ', 1)[-1] if '. ' in p[:4] else p for p in preguntas]
-    return preguntas[:n]
+    
+    # Filtrar preguntas que parezcan meta-comentarios o explicaciones
+    preguntas_validas = []
+    for p in preguntas:
+        p_lower = p.lower()
+        # Descartar si contiene palabras que indican meta-comunicación
+        if any(palabra in p_lower for palabra in ['entiendo que', 'quieres información', 'solicitas', 'pides', 'necesitas']):
+            continue
+        preguntas_validas.append(p)
+    
+    return preguntas_validas[:n]
 
 # ─────────────────────────────────────────────
 # DECISIÓN ZONA AGENTE (LLM + fallback semántico)
@@ -189,12 +229,20 @@ def validar_y_procesar(shield: QueryShield, query: str, tema: str, max_reintento
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
-def main():
+def main(qshield_externo=None):
+    """
+    Args:
+        qshield_externo: QueryShield pre-inicializado (para evitar recargar modelo)
+    """
     temas = seleccionar_temas()
-    shield = QueryShield(DB_CONFIG)
+    shield = qshield_externo if qshield_externo else QueryShield(DB_CONFIG)
     todas_las_queries = []
+    
+    print(f"   🎯 Temas seleccionados: {', '.join(temas)}")
+    print(f"   📊 Objetivo: {QUERIES_POR_TEMA} query(s) por tema\n")
 
     for tema in temas:
+        print(f"   📂 Procesando tema: {tema}")
         queries_aprobadas = []
         max_iteraciones = QUERIES_POR_TEMA * 5
         iteraciones = 0
@@ -212,12 +260,14 @@ def main():
                     resultado = validar_y_procesar(shield, candidata, tema)
                     if resultado:
                         queries_aprobadas.append(resultado)
+                        print(f"      ✅ {len(queries_aprobadas)}/{QUERIES_POR_TEMA} - {resultado['pregunta'][:70]}...")
 
             except Exception as e:
-                print(f"ERROR [{tema}]: {type(e).__name__}: {e}")
+                print(f"      ❌ Error generando candidatas: {e}")
                 break
 
         todas_las_queries.extend(queries_aprobadas)
+        print(f"   ✅ Tema '{tema}' completado: {len(queries_aprobadas)}/{QUERIES_POR_TEMA} queries aprobadas\n")
 
     # Guardar JSONL final
     with open("queries_validadas.jsonl", 'w', encoding='utf-8') as f:
@@ -226,6 +276,9 @@ def main():
             if "score" in q and hasattr(q["score"], "item"):
                 q["score"] = float(q["score"])
             f.write(json.dumps(q, ensure_ascii=False) + '\n')
+    
+    print(f"\n   💾 Total de queries guardadas: {len(todas_las_queries)}")
+    print(f"   📄 Archivo: queries_validadas.jsonl")
 
 
 if __name__ == "__main__":

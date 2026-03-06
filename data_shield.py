@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+import os
+import warnings
+import logging
+
+# Silenciar warnings y barras de progreso de transformers
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
+warnings.filterwarnings('ignore')
+logging.getLogger('transformers').setLevel(logging.ERROR)
+logging.getLogger('sentence_transformers').setLevel(logging.ERROR)
+
 import faiss, numpy as np, psycopg, pickle
 from pgvector.psycopg import register_vector
 from sentence_transformers import SentenceTransformer
@@ -27,13 +38,14 @@ class ResultadoValidacion:
 
 class DataShield:
     IDENTICAL_SCORE = 1.0
-    AGENT_ZONE_LOW  = 0.90
+    AGENT_ZONE_LOW  = 0.85
 
     def __init__(self, db_config: dict, faiss_path="faiss_index_bge3.bin", init_from_db=True):
         self.db_config   = db_config
         self.faiss_path  = Path(faiss_path)
         self.mapping     = []
-        self.model       = SentenceTransformer("BAAI/bge-m3")
+        self.model       = SentenceTransformer("BAAI/bge-m3", device='cpu')
+        self.model.tokenizer.model_max_length = 512  # Silenciar warnings de longitud
         self.faiss_index = self._load_faiss()
         if init_from_db and self.faiss_index.ntotal == 0:
             self._load_from_db()
@@ -109,8 +121,15 @@ class DataShield:
             return ResultadoValidacion(Estado.NUEVA, 0.0, razon="Sin datos en FAISS")
 
         bloques_detalle, max_score, best_match = [], 0.0, None
+        detener_procesamiento = False
 
         for i, block in enumerate(blocks):
+            # Si ya se encontró DUPLICADO perfecto, marcar como OMITIDO sin procesar
+            if detener_procesamiento:
+                bloques_detalle.append({"indice": i, "estado": "OMITIDO", "score": 0.0,
+                                        "uuid_historico": None, "chunk_num_historico": None})
+                continue
+
             emb = self._embed(block)
             uuid_hist, chunk_num_hist, score = self._buscar_similar(emb)
             estado_chunk = ("DUPLICADO" if score >= self.IDENTICAL_SCORE else
@@ -122,15 +141,23 @@ class DataShield:
                 best_match = {"bloque_nuevo": i, "bloque_nuevo_texto": block,
                               "uuid_historico": uuid_hist, "bloque_historico": chunk_num_hist}
 
+            # Solo detener en DUPLICADO perfecto (>= 1.0), NO en AGENTE
+            # Los chunks AGENTE se procesarán todos y serán validados por LLM
+            if estado_chunk == "DUPLICADO":
+                detener_procesamiento = True
+
         duplicados = sum(1 for b in bloques_detalle if b["estado"] == "DUPLICADO")
         agentes    = sum(1 for b in bloques_detalle if b["estado"] == "AGENTE")
+        omitidos   = sum(1 for b in bloques_detalle if b["estado"] == "OMITIDO")
 
         if duplicados > 0:
+            razon = f"{duplicados} chunk(s) duplicados" + (f", {omitidos} omitidos" if omitidos > 0 else "")
             return ResultadoValidacion(Estado.DUPLICADO, max_score, best_match["uuid_historico"],
-                                       f"{duplicados} chunk(s) duplicados", best_match, bloques_detalle)
+                                       razon, best_match, bloques_detalle)
         elif agentes > 0:
+            razon = f"{agentes} chunk(s) en zona AGENTE"
             return ResultadoValidacion(Estado.AGENTE, max_score, best_match["uuid_historico"],
-                                       f"{agentes} chunk(s) en zona AGENTE", best_match, bloques_detalle)
+                                       razon, best_match, bloques_detalle)
         return ResultadoValidacion(Estado.NUEVA, max_score, None, "Contenido nuevo", best_match, bloques_detalle)
 
     # ── Agregar (aprobado) ────────────────────────────────────────
@@ -171,14 +198,33 @@ class DataShield:
 
         chunk_ids = []
         for i, block in enumerate(blocks):
-            emb  = self._embed(block)
-            score = bloques_detalle[i].get("score", 0.0) if bloques_detalle and i < len(bloques_detalle) else 0.0
+            # Verificar si el chunk fue OMITIDO (no procesado)
+            es_omitido = False
+            uuid_similar = None
+            chunk_num_similar = None
+            
+            if bloques_detalle and i < len(bloques_detalle):
+                es_omitido = bloques_detalle[i].get("estado") == "OMITIDO"
+                uuid_similar = bloques_detalle[i].get("uuid_historico")
+                chunk_num_similar = bloques_detalle[i].get("chunk_num_historico")
+            
+            # Solo calcular embedding si NO fue omitido
+            if es_omitido:
+                emb = None
+                score = 0.0
+                estado_db = "omitido"
+            else:
+                emb = self._embed(block)
+                score = bloques_detalle[i].get("score", 0.0) if bloques_detalle and i < len(bloques_detalle) else 0.0
+                estado_db = "rechazado"
 
             cur.execute("""
                 INSERT INTO documents_logs
-                    (uuid, chunk_numero, chunk, url_busqueda, estado, score_similar, decision, chunk_embedding)
-                VALUES (%s,%s,%s,%s,'rechazado',%s,%s,%s) RETURNING id
-            """, (doc_uuid, i, block, url, score, decision, emb.tolist()))
+                    (uuid, chunk_numero, chunk, url_busqueda, estado, score_similar, decision, 
+                     uuid_chunk_similar, chunk_num_similar, chunk_embedding)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+            """, (doc_uuid, i, block, url, estado_db, score, decision, 
+                  uuid_similar, chunk_num_similar, emb.tolist() if emb is not None else None))
 
             chunk_ids.append((i, cur.fetchone()[0]))
 
