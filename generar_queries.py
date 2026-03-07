@@ -31,8 +31,7 @@ DB_CONFIG = {
     "dbname": "datacorpus_bd",
     "user": "datacorpus",
     "password": "730822",
-    "host": "localhost",
-    "port": 5433
+    "host": "localhost"
 }
 
 TOKEN_TOGETHER = "tgp_v1_35Ewiz4u1GT4huetCkSeITDZ9eyw-6tNcuYlSn5X7lY"

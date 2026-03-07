@@ -16,8 +16,7 @@ DB_CONFIG = {
     "dbname": "datacorpus_bd",
     "user": "datacorpus",
     "password": "730822",
-    "host": "localhost",
-    "port": 5433
+    "host": "localhost"
 }
 
 FAISS_INDEX_PATH = Path("faiss_index_bge3.bin")

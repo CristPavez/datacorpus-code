@@ -10,8 +10,7 @@ DB_CONFIG = {
     "dbname": "datacorpus_bd",
     "user": "datacorpus",
     "password": "730822",
-    "host": "localhost",
-    "port": 5433
+    "host": "localhost"
 }
 
 # ── BRAVE SEARCH API ──────────────────────────────────────────────
@@ -314,7 +313,7 @@ def main(dshield_externo=None, qshield_externo=None):
                 shield.agregar_solo_logs(doc_id, contenido, url, "RECHAZADO", val.bloques_detalle)
                 print("      ⏭️  Probando siguiente URL...\n")
                 # Guardar info para registrar en logs si todas las URLs fallan
-                if not mejor_rechazo or val.score > mejor_rechazo['score']:
+                if not mejor_rechazo or val.score > mejor_rechazo['val'].score:
                     mejor_rechazo = {'val': val, 'estado': 'DUPLICADO'}
                 continue  # Pasar a la siguiente URL
 
@@ -375,7 +374,7 @@ def main(dshield_externo=None, qshield_externo=None):
                     print("      🧠 LLM rechazó al menos 1 chunk → Documento rechazado")
                     print("      ⏭️  Probando siguiente URL...\n")
                     # Guardar info para registrar en logs si todas las URLs fallan
-                    if not mejor_rechazo or val.score > mejor_rechazo['score']:
+                    if not mejor_rechazo or val.score > mejor_rechazo['val'].score:
                         mejor_rechazo = {'val': val, 'estado': 'AGENTE'}
                     continue  # Pasar a la siguiente URL
 
