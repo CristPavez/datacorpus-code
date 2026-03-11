@@ -40,7 +40,7 @@ class DataShield:
     IDENTICAL_SCORE = 1.0
     AGENT_ZONE_LOW  = 0.85
 
-    def __init__(self, db_config: dict, faiss_path="faiss_index_bge3.bin", init_from_db=True):
+    def __init__(self, db_config: dict, faiss_path="faiss_index_bge3.bin", init_from_db=False):
         self.db_config   = db_config
         self.faiss_path  = Path(faiss_path)
         self.mapping     = []
@@ -73,7 +73,7 @@ class DataShield:
 
     def _load_from_db(self):
         conn = self._get_conn(); cur = conn.cursor()
-        cur.execute("SELECT uuid, chunk_numero, chunk_embedding FROM documents_logs ORDER BY id LIMIT 50000")
+        cur.execute("SELECT uuid, chunk_numero, chunk_embedding FROM documents_logs WHERE chunk_embedding IS NOT NULL AND estado = 'procesado' ORDER BY id")
         rows = cur.fetchall()
         cur.close(); conn.close()
         if not rows: return

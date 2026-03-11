@@ -24,6 +24,48 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from query_shield import QueryShield, Estado
 
+# Frases que indican que el LLM respondió con meta-comunicación en vez de una pregunta
+_FRASES_RUIDO = [
+    "i'm sorry", "i am sorry", "lo siento",
+    "could you clarify", "could you please", "please clarify",
+    "i'm not sure", "i am not sure", "let me know",
+    "entiendo que", "quieres información", "solicitas", "me pides",
+    "if you can provide", "si puedes proporcionar",
+    "i'll do my best", "i will do my best",
+    "as an ai", "como ia", "como modelo de",
+    "here are", "aquí tienes", "a continuación",
+    "seem to be asking", "seems like you",
+    "necesitas", "pides",
+]
+
+_PALABRAS_INGLES = {
+    "the", "and", "for", "that", "with", "this", "are", "you",
+    "what", "how", "why", "when", "where", "which", "can", "but",
+    "about", "your", "have", "from", "they", "will", "more", "also",
+    "some", "just", "into", "than", "been", "would", "could", "should",
+}
+
+
+def _es_pregunta_valida(texto: str) -> bool:
+    """Devuelve True si el texto parece una pregunta técnica real."""
+    p = texto.strip()
+    p_lower = p.lower()
+
+    if "?" not in p:
+        return False
+    if len(p) > 500:
+        return False
+    if any(frase in p_lower for frase in _FRASES_RUIDO):
+        return False
+
+    palabras = p_lower.split()
+    if len(palabras) > 5:
+        hits = sum(1 for w in palabras if w in _PALABRAS_INGLES)
+        if hits / len(palabras) > 0.25:
+            return False
+
+    return True
+
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────
@@ -36,7 +78,7 @@ DB_CONFIG = {
 
 TOKEN_TOGETHER = "tgp_v1_35Ewiz4u1GT4huetCkSeITDZ9eyw-6tNcuYlSn5X7lY"
 
-QUERIES_POR_TEMA = 25
+QUERIES_POR_TEMA = 1
 
 TEMAS_VALIDOS = [
     "Medicina", "Legal / Derecho", "Finanzas", "Tecnología", "Educación / Académico",
@@ -125,21 +167,18 @@ def generar_preguntas_lm(tema: str, n: int) -> List[str]:
 
     texto = response.choices[0].message.content.strip()
     
-    # Extraer solo las líneas que son preguntas (contienen '?')
-    preguntas = [l.strip() for l in texto.split('\n') if l.strip() and '?' in l]
-    
     # Limpiar numeración si existe (ej: "1. ¿Pregunta?" → "¿Pregunta?")
-    preguntas = [p.split('. ', 1)[-1] if '. ' in p[:4] else p for p in preguntas]
-    
-    # Filtrar preguntas que parezcan meta-comentarios o explicaciones
-    preguntas_validas = []
-    for p in preguntas:
-        p_lower = p.lower()
-        # Descartar si contiene palabras que indican meta-comunicación
-        if any(palabra in p_lower for palabra in ['entiendo que', 'quieres información', 'solicitas', 'pides', 'necesitas']):
+    lineas = []
+    for l in texto.split('\n'):
+        l = l.strip()
+        if not l:
             continue
-        preguntas_validas.append(p)
-    
+        l = l.split('. ', 1)[-1] if '. ' in l[:4] else l
+        lineas.append(l)
+
+    # Filtrar con validación robusta (inglés, meta-frases, sin '?', demasiado larga)
+    preguntas_validas = [l for l in lineas if _es_pregunta_valida(l)]
+
     return preguntas_validas[:n]
 
 # ─────────────────────────────────────────────
@@ -196,7 +235,7 @@ def validar_y_procesar(shield: QueryShield, query: str, tema: str, max_reintento
         resultado = shield.validar(uid, query_actual)
 
         if resultado.estado == Estado.NUEVA:
-            #shield.agregar(uid, query_actual, tema)
+            shield.agregar(uid, query_actual, tema)
             shield.log_validacion(uid, query_actual, resultado.uuid_parecida,
                                   Estado.NUEVA.value, resultado.score, "APROBADO", tema)
             return {"id": uid, "pregunta": query_actual, "tema": tema, "score": resultado.score}
@@ -210,7 +249,7 @@ def validar_y_procesar(shield: QueryShield, query: str, tema: str, max_reintento
 
         elif resultado.estado == Estado.AGENTE:
             if decidir_agente(query_actual, resultado.texto_historico):
-                # shield.agregar(uid, query_actual, tema)
+                shield.agregar(uid, query_actual, tema)
                 shield.log_validacion(uid, query_actual, resultado.uuid_parecida,
                                       Estado.AGENTE.value, resultado.score, "APROBADO", tema)
                 return {"id": uid, "pregunta": query_actual, "tema": tema, "score": resultado.score}
@@ -247,23 +286,33 @@ def main(qshield_externo=None):
         iteraciones = 0
 
         # Genera en lotes hasta completar QUERIES_POR_TEMA
+        errores_consecutivos = 0
+        MAX_ERRORES_CONSECUTIVOS = 3
         while len(queries_aprobadas) < QUERIES_POR_TEMA and iteraciones < max_iteraciones:
             n_generar = min((QUERIES_POR_TEMA - len(queries_aprobadas)) * 2, QUERIES_POR_TEMA)
             try:
                 candidatas = generar_preguntas_lm(tema, n=n_generar)
-                iteraciones += len(candidatas)
-
-                for candidata in candidatas:
-                    if len(queries_aprobadas) >= QUERIES_POR_TEMA:
-                        break
-                    resultado = validar_y_procesar(shield, candidata, tema)
-                    if resultado:
-                        queries_aprobadas.append(resultado)
-                        print(f"      ✅ {len(queries_aprobadas)}/{QUERIES_POR_TEMA} - {resultado['pregunta'][:70]}...")
-
+                errores_consecutivos = 0
             except Exception as e:
                 print(f"      ❌ Error generando candidatas: {e}")
-                break
+                errores_consecutivos += 1
+                if errores_consecutivos >= MAX_ERRORES_CONSECUTIVOS:
+                    print(f"      ⚠️  {MAX_ERRORES_CONSECUTIVOS} errores consecutivos, abandonando tema")
+                    break
+                continue
+
+            iteraciones += len(candidatas)
+            for candidata in candidatas:
+                if len(queries_aprobadas) >= QUERIES_POR_TEMA:
+                    break
+                try:
+                    resultado = validar_y_procesar(shield, candidata, tema)
+                except Exception as e:
+                    print(f"      ❌ Error validando query: {e}")
+                    continue
+                if resultado:
+                    queries_aprobadas.append(resultado)
+                    print(f"      ✅ {len(queries_aprobadas)}/{QUERIES_POR_TEMA} - {resultado['pregunta'][:70]}...")
 
         todas_las_queries.extend(queries_aprobadas)
         print(f"   ✅ Tema '{tema}' completado: {len(queries_aprobadas)}/{QUERIES_POR_TEMA} queries aprobadas\n")

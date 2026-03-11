@@ -50,7 +50,6 @@ class QueryShield:
         self.model.tokenizer.model_max_length = 512  # Silenciar warnings de longitud
         self.uuid_mapping = []
         self.faiss_index = self._load_or_create_faiss()
-        self._sync_pg_faiss()
 
     # ── Conexión ──────────────────────────────
     def _get_conn(self):
@@ -124,7 +123,7 @@ class QueryShield:
 
     # ── MÉTODO PÚBLICO: agregar ───────────────
     def agregar(self, uuid: str, pregunta: str, tema: str):
-        """Inserta query aprobada en BD + sincroniza FAISS."""
+        """Inserta query aprobada en BD + actualiza FAISS incrementalmente."""
         embedding = self.model.encode(pregunta)
         faiss.normalize_L2(embedding.reshape(1, -1))
 
@@ -135,7 +134,11 @@ class QueryShield:
         cur.close()
         conn.close()
 
-        self._sync_pg_faiss()
+        # Actualización incremental: evita rebuild completo en cada query aprobada
+        if uuid not in self.uuid_mapping:
+            self.faiss_index.add(embedding.reshape(1, -1).astype('float32'))
+            self.uuid_mapping.append(uuid)
+            self._save_faiss()
 
     # ── MÉTODO PÚBLICO: log_validacion ────────
     def log_validacion(self, uuid: str, pregunta: str, uuid_similar: Optional[str],

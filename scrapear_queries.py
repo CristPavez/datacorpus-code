@@ -43,7 +43,7 @@ def leer_queries():
 def buscar_brave(query: str, max_results=3):
     """
     Busca usando la API de Brave Search.
-    Más confiable que el scraping de DuckDuckGo.
+    Incluye reintentos con backoff exponencial en caso de rate limit (429).
     """
     url = "https://api.search.brave.com/res/v1/web/search"
     headers = {
@@ -57,76 +57,42 @@ def buscar_brave(query: str, max_results=3):
         "search_lang": "es",
         "country": "es"
     }
-    
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        results = []
-        if "web" in data and "results" in data["web"]:
-            for item in data["web"]["results"][:max_results]:
-                results.append({'url': item.get('url', '')})
-        
-        if not results:
-            print(f"      ⚠️  No se encontraron resultados para la query: {query}")
-        
-        return results
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 401:
-            print(f"      ⚠️  Error de autenticación: Verifica tu BRAVE_API_KEY")
-        elif e.response.status_code == 429:
-            print(f"      ⚠️  Límite de requests alcanzado. Espera antes de continuar.")
-        else:
-            print(f"      ⚠️  Error HTTP {e.response.status_code}: {e}")
-        return []
-    except Exception as e:
-        print(f"      ⚠️  Error buscando en Brave Search: {e}")
-        return []
 
-def scrapear_duckduckgo(query: str, max_results=3):
-    """
-    DEPRECADO: Usa buscar_brave() en su lugar.
-    Se mantiene como fallback por compatibilidad.
-    """
-    from datetime import datetime
-    import tempfile, os
-    q = query.replace('¿','').replace('?','')
-    url = f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Referer': 'https://duckduckgo.com/'
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        html = resp.text
-        # Guardar HTML en archivo temporal
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.html', prefix='duckdbg_', mode='w', encoding='utf-8') as f:
-            f.write(html)
-            temp_html_path = f.name
-        # Detectar posibles bloqueos/captcha
-        if 'captcha' in html.lower() or 'Cloudflare' in html or 'Please verify' in html:
-            print(f"      ⚠️  DuckDuckGo puede estar bloqueando el scraping o mostrando un captcha. Revisa {temp_html_path}")
+    for intento in range(3):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            results = []
+            if "web" in data and "results" in data["web"]:
+                for item in data["web"]["results"][:max_results]:
+                    results.append({'url': item.get('url', '')})
+
+            if not results:
+                print(f"      ⚠️  No se encontraron resultados para la query: {query}")
+
+            return results
+
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                espera = 2 ** intento  # 1s, 2s, 4s
+                print(f"      ⚠️  Rate limit (429). Reintentando en {espera}s... ({intento + 1}/3)")
+                time.sleep(espera)
+                continue
+            elif e.response.status_code == 401:
+                print(f"      ⚠️  Error de autenticación: Verifica tu BRAVE_API_KEY")
+                return []
+            else:
+                print(f"      ⚠️  Error HTTP {e.response.status_code}: {e}")
+                return []
+        except Exception as e:
+            print(f"      ⚠️  Error buscando en Brave Search: {e}")
             return []
-        soup = BeautifulSoup(html, 'html.parser')
-        results = []
-        # Probar selectores alternativos
-        for r in soup.select('div.result, div.web-result, div#links .result'):
-            a = r.find('a', class_='result__a')
-            if not a:
-                a = r.find('a', href=True)
-            if a:
-                results.append({'url': a.get('href','')})
-            if len(results) >= max_results:
-                break
-        if not results:
-            print(f"      ⚠️  No se encontraron resultados en el HTML. Revisa {temp_html_path} para ajustar el selector.")
-        return results
-    except Exception as e:
-        print(f"      ⚠️  Error scraping DuckDuckGo para query: {query} → {e}")
-        return []
+
+    print(f"      ⚠️  Sin resultados tras 3 intentos (rate limit persistente)")
+    return []
+
 
 def extraer_contenido(url: str):
     try:
@@ -137,7 +103,8 @@ def extraer_contenido(url: str):
             url = unquote(params['uddg'][0]) if 'uddg' in params else url
         downloaded = trafilatura.fetch_url(url)
         return trafilatura.extract(downloaded) if downloaded else None
-    except:
+    except Exception as e:
+        print(f"      ⚠️  Error extrayendo contenido de {url[:60]}: {e}")
         return None
 
 def decidir_con_llm(chunk_nuevo: str, chunk_existente: str) -> bool:
@@ -183,62 +150,6 @@ def decidir_con_llm(chunk_nuevo: str, chunk_existente: str) -> bool:
         # En caso de error, es mejor GUARDAR (True) para no perder datos por un fallo de API
         return True
 
-def procesar_query(query: dict, shield: DataShield):
-    qid, qtexto, tema = query['id'], query['pregunta'], query['tema']
-    print(f"\n{'='*60}\n🔍 {qtexto[:80]}")
-
-    resultados = buscar_brave(qtexto)
-    print(f"   [DEBUG] Resultados encontrados: {len(resultados)}")
-
-    for idx, r in enumerate(resultados):
-        url = r['url']
-        print(f"   [DEBUG] URL resultado {idx+1}: {url}")
-        contenido = extraer_contenido(url)
-        if not contenido:
-            print(f"   [DEBUG] No se pudo extraer contenido de la URL.")
-            continue
-        print(f"   [DEBUG] Longitud del contenido extraído: {len(contenido)}")
-        if len(contenido) < 100:
-            print(f"   [DEBUG] Contenido demasiado corto (<100 caracteres).")
-            continue
-
-        doc_id = qid  # Usar el uuid del JSONL para todo el proceso
-        val = shield.validar(doc_id, contenido)
-        print(f"   🌐 {url[:60]} | Estado: {val.estado.value} | Score: {val.score:.3f} | {val.razon}")
-
-        if val.estado == Estado.NUEVA:
-            shield.agregar(doc_id, contenido, tema, url, "APROBADO")
-            print("   ✅ GUARDADO"); return
-
-        elif val.estado == Estado.DUPLICADO:
-            shield.agregar_solo_logs(doc_id, contenido, url, "RECHAZADO", val.bloques_detalle)
-            print("   🔴 DUPLICADO → Probando siguiente URL")
-            continue  # Pasar a la siguiente URL
-
-        elif val.estado == Estado.AGENTE:
-            chunk_nuevo = val.bloque_match.get("bloque_nuevo_texto", "") if val.bloque_match else ""
-            chunk_hist = ""
-            if val.bloque_match and val.bloque_match.get("uuid_historico"):
-                try:
-                    conn = psycopg.connect(**DB_CONFIG)
-                    cur = conn.cursor()
-                    cur.execute("SELECT chunk FROM documents_logs WHERE uuid=%s AND chunk_numero=%s",
-                                (val.bloque_match["uuid_historico"], val.bloque_match["bloque_historico"]))
-                    row = cur.fetchone()
-                    chunk_hist = row[0] if row else ""
-                    cur.close(); conn.close()
-                except: pass
-
-            print(f"   [DEBUG] LLM comparación: chunk_nuevo({len(chunk_nuevo)}) vs chunk_hist({len(chunk_hist)})")
-            if decidir_con_llm(chunk_nuevo, chunk_hist):
-                shield.agregar(doc_id, contenido, tema, url, "APROBADO_LLM")
-                print("   🟡 LLM → APROBADO"); return
-            else:
-                shield.agregar_solo_logs(doc_id, contenido, url, "RECHAZADO_LLM", val.bloques_detalle)
-                print("   🟡 LLM → RECHAZADO → Probando siguiente URL")
-                continue  # Pasar a la siguiente URL
-
-    print("   ⚠️  Sin resultados aprobados")
 
 def main(dshield_externo=None, qshield_externo=None):
     """
@@ -247,15 +158,15 @@ def main(dshield_externo=None, qshield_externo=None):
         qshield_externo: QueryShield pre-inicializado (para evitar recargar modelo)
     """
     queries = leer_queries()
-    shield = dshield_externo if dshield_externo else DataShield(DB_CONFIG, init_from_db=True)
+    shield = dshield_externo if dshield_externo else DataShield(DB_CONFIG)
     qshield = qshield_externo if qshield_externo else QueryShield(DB_CONFIG)
     
     print(f"   📊 Total de queries a procesar: {len(queries)}\n")
 
-    def procesar_query_guardar_query(query, shield, qshield):
+    def procesar_query_guardar_query(query, shield, qshield, idx):
         qid, qtexto, tema = query['id'], query['pregunta'], query['tema']
         print(f"\n{'#'*70}")
-        print(f"Query {queries.index(query)+1}/{len(queries)}")
+        print(f"Query {idx}/{len(queries)}")
         print(f"{'#'*70}")
         print(f"\n🔍 {qtexto[:80]}")
         
@@ -318,22 +229,23 @@ def main(dshield_externo=None, qshield_externo=None):
                 continue  # Pasar a la siguiente URL
 
             elif val.estado == Estado.AGENTE:
-                # NUEVO: Validar TODOS los chunks en zona AGENTE con LLM
+                # Validar TODOS los chunks en zona AGENTE con LLM
                 chunks_agente = [b for b in val.bloques_detalle if b["estado"] == "AGENTE"]
                 print(f"      🧠 Validando {len(chunks_agente)} chunk(s) en zona AGENTE con LLM...")
-                
+
                 # Obtener el texto original dividido en chunks para acceder a los textos nuevos
                 bloques_originales = shield._split_text(contenido)
-                
-                aprobado_por_llm = True  # Asumimos aprobado hasta que LLM rechace
-                
+
+                chunks_rechazados = 0
+
                 for bloque in chunks_agente:
                     idx_chunk = bloque["indice"]
                     chunk_nuevo = bloques_originales[idx_chunk] if idx_chunk < len(bloques_originales) else ""
                     chunk_hist = ""
-                    
-                    # Obtener chunk histórico de BD
+
+                    # Obtener chunk histórico de BD (con cierre garantizado)
                     if bloque.get("uuid_historico"):
+                        conn = None
                         try:
                             conn = psycopg.connect(**DB_CONFIG)
                             cur = conn.cursor()
@@ -344,22 +256,25 @@ def main(dshield_externo=None, qshield_externo=None):
                             row = cur.fetchone()
                             chunk_hist = row[0] if row else ""
                             cur.close()
-                            conn.close()
                         except Exception as e:
                             print(f"         ⚠️  Error obteniendo chunk histórico: {e}")
-                    
+                        finally:
+                            if conn:
+                                conn.close()
+
                     # Validar con LLM
                     print(f"         🔄 Chunk #{idx_chunk} (score: {bloque['score']:.3f})...", end=" ")
                     decision_llm = decidir_con_llm(chunk_nuevo, chunk_hist)
-                    
+
                     if decision_llm:  # TRUE → NUEVO
                         print("✅ DIFERENTE")
-                        continue  # Pasar al siguiente chunk
                     else:  # FALSE → DUPLICADO
                         print("❌ DUPLICADO")
-                        aprobado_por_llm = False
-                        break  # Detener validación inmediatamente
-                
+                        chunks_rechazados += 1
+
+                # Rechazar solo si más del 50% de chunks AGENTE son duplicados
+                aprobado_por_llm = chunks_rechazados < len(chunks_agente) / 2
+
                 # Decisión final después de validar todos los chunks AGENTE
                 if aprobado_por_llm:
                     shield.agregar(doc_id, contenido, tema, url, "APROBADO_LLM")
@@ -394,7 +309,7 @@ def main(dshield_externo=None, qshield_externo=None):
 
     # Procesar todas las queries
     for i, query in enumerate(queries, 1):
-        procesar_query_guardar_query(query, shield, qshield)
+        procesar_query_guardar_query(query, shield, qshield, i)
         if i < len(queries):  # Pequeña pausa entre queries (excepto la última)
             time.sleep(1)
 

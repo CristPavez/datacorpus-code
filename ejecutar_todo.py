@@ -107,7 +107,8 @@ def validar_jsonl() -> bool:
     if not os.path.exists(QUERIES_FILE):
         print(f"   ❌ No existe '{QUERIES_FILE}'")
         return False
-    count = sum(1 for l in open(QUERIES_FILE, encoding="utf-8") if l.strip())
+    with open(QUERIES_FILE, encoding="utf-8") as f:
+        count = sum(1 for l in f if l.strip())
     if count == 0:
         print(f"   ❌ '{QUERIES_FILE}' está vacío")
         return False
@@ -125,8 +126,7 @@ def obtener_resumen(timestamp_inicio=None):
         resumen["preguntas_generadas"] = 0
 
     try:
-        conn = psycopg.connect(dbname="datacorpus_bd", user="datacorpus",
-                               password="730822", host="localhost", port=5433)
+        conn = psycopg.connect(**DB_CONFIG)
         cur = conn.cursor()
         
         # === ESTA EJECUCIÓN ===
@@ -290,7 +290,7 @@ if __name__ == "__main__":
     print("="*70 + "\n")
     
     # 0. Sincronizar índice FAISS con BD
-    rebuild_faiss_automatico()
+    # rebuild_faiss_automatico()
     
     # 1. Cargar modelos una sola vez (OPTIMIZACIÓN)
     print("\n" + "─"*70)
@@ -305,7 +305,7 @@ if __name__ == "__main__":
     print("   ✅ QueryShield listo")
     
     print("   ⚙️  Cargando DataShield (content deduplication)...")
-    dshield = DataShield(DB_CONFIG, init_from_db=True)
+    dshield = DataShield(DB_CONFIG)
     print("   ✅ DataShield listo")
     
     print("   🎯 Modelos cargados y reutilizables en todo el pipeline\n")
