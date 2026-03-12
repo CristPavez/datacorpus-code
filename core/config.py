@@ -5,7 +5,7 @@
 from pathlib import Path
 
 # ── BASE DIR ──────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).parent.parent
 
 # ── BASE DE DATOS ─────────────────────────────────────────────────
 DB_CONFIG = {
@@ -32,19 +32,19 @@ MODEL_DOCS       = "BAAI/bge-m3"                             # dim=1024, para do
 MODEL_MAX_LENGTH = 512
 
 # ── FAISS — DOCUMENTOS (DataShield, BGE-M3) ───────────────────────
-FAISS_DOCS_PATH    = BASE_DIR / "faiss_docs.bin"
-FAISS_DOCS_MAPPING = BASE_DIR / "faiss_docs.mapping"
+FAISS_DOCS_PATH    = BASE_DIR / "data" / "faiss" / "faiss_docs.bin"
+FAISS_DOCS_MAPPING = BASE_DIR / "data" / "faiss" / "faiss_docs.mapping"
 FAISS_DOCS_DIM     = 1024
 FAISS_DOCS_HNSW_M  = 32
 
 # ── FAISS — QUERIES (QueryShield, MiniLM) ────────────────────────
-FAISS_QUERY_PATH    = BASE_DIR / "faiss_queries.bin"
-FAISS_QUERY_MAPPING = BASE_DIR / "faiss_queries.mapping"
+FAISS_QUERY_PATH    = BASE_DIR / "data" / "faiss" / "faiss_queries.bin"
+FAISS_QUERY_MAPPING = BASE_DIR / "data" / "faiss" / "faiss_queries.mapping"
 FAISS_QUERY_DIM     = 384
 FAISS_QUERY_HNSW_M  = 32
 
 # ── ARCHIVOS DE DATOS ─────────────────────────────────────────────
-QUERIES_FILE = BASE_DIR / "queries_validadas.jsonl"
+QUERIES_FILE = BASE_DIR / "data" / "queries_validadas.jsonl"
 
 # ── TEMAS VÁLIDOS ─────────────────────────────────────────────────
 TEMAS_VALIDOS = [

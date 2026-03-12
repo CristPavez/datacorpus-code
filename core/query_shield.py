@@ -27,7 +27,7 @@ from enum import Enum
 from typing import Optional
 from pgvector.psycopg import register_vector
 from sentence_transformers import SentenceTransformer
-from config import (MODEL_QUERY, MODEL_MAX_LENGTH,
+from .config import (MODEL_QUERY, MODEL_MAX_LENGTH,
                     FAISS_QUERY_DIM, FAISS_QUERY_HNSW_M, FAISS_QUERY_PATH)
 
 

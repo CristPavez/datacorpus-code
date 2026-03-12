@@ -18,7 +18,7 @@ import psycopg
 from datetime import datetime
 from email.message import EmailMessage
 from typing import Optional
-from config import (DB_CONFIG, QUERIES_FILE,
+from .config import (DB_CONFIG, QUERIES_FILE,
                     EMAIL_FROM, EMAIL_TO, EMAIL_PASSWORD, SMTP_HOST, SMTP_PORT)
 
 
@@ -147,27 +147,31 @@ def enviar_correo(timestamp_inicio: datetime):
 
 
 # ── Función callable desde la API ────────────────────────────────
-def run_pipeline(stop_event: Optional[threading.Event] = None):
-    """Punto de entrada para la API FastAPI. Ejecuta el pipeline completo."""
+def run_pipeline(stop_event: Optional[threading.Event] = None, qshield=None, dshield=None):
+    """Punto de entrada para la API FastAPI. Ejecuta el pipeline completo.
+    qshield y dshield se pasan ya cargados desde el lifespan del servidor.
+    Si no se pasan (ejecución por terminal), se cargan aquí.
+    """
     timestamp_inicio = datetime.now()
 
     print("\n" + "="*70)
     print("DATACORPUS PIPELINE - INICIO".center(70))
     print("="*70 + "\n")
 
-    print("\n" + "─"*70)
-    print("CARGANDO MODELOS DE IA".center(70))
-    print("─"*70)
+    if qshield is None or dshield is None:
+        print("\n" + "─"*70)
+        print("CARGANDO MODELOS DE IA".center(70))
+        print("─"*70)
 
-    from query_shield import QueryShield
-    from data_shield  import DataShield
+        from .query_shield import QueryShield
+        from .data_shield  import DataShield
 
-    print("   Cargando QueryShield...")
-    qshield = QueryShield(DB_CONFIG)
-    print("   ✅ QueryShield listo")
-    print("   Cargando DataShield...")
-    dshield = DataShield(DB_CONFIG)
-    print("   ✅ DataShield listo\n")
+        print("   Cargando QueryShield...")
+        qshield = qshield or QueryShield(DB_CONFIG)
+        print("   ✅ QueryShield listo")
+        print("   Cargando DataShield...")
+        dshield = dshield or DataShield(DB_CONFIG)
+        print("   ✅ DataShield listo\n")
 
     if stop_event and stop_event.is_set():
         print("   ⏹️  Detención solicitada antes de iniciar"); return
@@ -176,7 +180,7 @@ def run_pipeline(stop_event: Optional[threading.Event] = None):
     print("GENERACION DE QUERIES".center(70))
     print("─"*70 + "\n")
 
-    from generar_queries import main as main_queries
+    from .generar_queries import main as main_queries
     main_queries(qshield_externo=qshield)
 
     if stop_event and stop_event.is_set():
@@ -189,7 +193,7 @@ def run_pipeline(stop_event: Optional[threading.Event] = None):
     print("SCRAPING Y VALIDACION DE CONTENIDO".center(70))
     print("─"*70 + "\n")
 
-    from scrapear_queries import main as main_scraper
+    from .scrapear_queries import main as main_scraper
     main_scraper(dshield_externo=dshield, qshield_externo=qshield, stop_event=stop_event)
 
     print("\n" + "─"*70)
@@ -222,8 +226,8 @@ if __name__ == "__main__":
     print("CARGANDO MODELOS DE IA".center(70))
     print("─"*70)
 
-    from query_shield import QueryShield
-    from data_shield  import DataShield
+    from .query_shield import QueryShield
+    from .data_shield  import DataShield
 
     print("   Cargando QueryShield...")
     qshield = QueryShield(DB_CONFIG)
@@ -235,7 +239,7 @@ if __name__ == "__main__":
 
     # ── Modo reparador solamente ──────────────────────────────────
     if modo_solo_reparar:
-        from flujo_reparador import ejecutar_flujo_reparador
+        from .flujo_reparador import ejecutar_flujo_reparador
         ejecutar_flujo_reparador(qshield, dshield)
         enviar_correo(timestamp_inicio)
         sys.exit(0)
@@ -245,7 +249,7 @@ if __name__ == "__main__":
     print("GENERACION DE QUERIES".center(70))
     print("─"*70 + "\n")
 
-    from generar_queries import main as main_queries
+    from .generar_queries import main as main_queries
     main_queries(qshield_externo=qshield)
 
     # ── 2. Validar JSONL ──────────────────────────────────────────
@@ -258,12 +262,12 @@ if __name__ == "__main__":
     print("SCRAPING Y VALIDACION DE CONTENIDO".center(70))
     print("─"*70 + "\n")
 
-    from scrapear_queries import main as main_scraper
+    from .scrapear_queries import main as main_scraper
     main_scraper(dshield_externo=dshield, qshield_externo=qshield)
 
     # ── 4. Flujo reparador (opcional) ─────────────────────────────
     if modo_reparar_al_final:
-        from flujo_reparador import ejecutar_flujo_reparador
+        from .flujo_reparador import ejecutar_flujo_reparador
         ejecutar_flujo_reparador(qshield, dshield)
 
     # ── 5. Correo ─────────────────────────────────────────────────

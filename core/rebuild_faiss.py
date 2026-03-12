@@ -18,7 +18,7 @@ import numpy as np
 import psycopg
 import pickle
 from pgvector.psycopg import register_vector
-from config import (DB_CONFIG,
+from .config import (DB_CONFIG,
                     FAISS_DOCS_PATH, FAISS_DOCS_MAPPING,
                     FAISS_DOCS_DIM, FAISS_DOCS_HNSW_M,
                     FAISS_QUERY_PATH, FAISS_QUERY_MAPPING,
@@ -111,15 +111,8 @@ def rebuild_queries_faiss():
     _guardar(index, mapping, FAISS_QUERY_PATH, FAISS_QUERY_MAPPING)
 
 
-# ── Guardar con backup ────────────────────────────────────────────
+# ── Guardar ───────────────────────────────────────────────────────
 def _guardar(index, mapping, bin_path, map_path):
-    for path in (bin_path, map_path):
-        if path.exists():
-            bak = path.with_suffix(path.suffix + ".backup")
-            if bak.exists():
-                bak.unlink()
-            path.rename(bak)
-
     faiss.write_index(index, str(bin_path))
     with open(map_path, "wb") as f:
         pickle.dump(mapping, f)

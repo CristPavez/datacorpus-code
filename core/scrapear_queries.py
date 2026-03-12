@@ -22,9 +22,9 @@ import psycopg
 import requests
 from urllib.parse import urlparse, parse_qs, unquote
 from openai import OpenAI
-from data_shield import DataShield, ResultadoChunk
-from query_shield import QueryShield
-from config import DB_CONFIG, BRAVE_API_KEY, TOGETHER_API_KEY, QUERIES_FILE
+from .data_shield import DataShield, ResultadoChunk
+from .query_shield import QueryShield
+from .config import DB_CONFIG, BRAVE_API_KEY, TOGETHER_API_KEY, QUERIES_FILE
 
 
 # ── Cliente LLM ──────────────────────────────────────────────────

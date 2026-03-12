@@ -68,8 +68,8 @@ DataCorpus automatiza la construcción de un corpus documental en español organ
 
 ```
 datacorpus-code/
-├── api/
-│   ├── main.py                 # App FastAPI: CORS, WebSocket /ws/logs, /health
+├── api/                        # Backend FastAPI
+│   ├── main.py                 # App: CORS, lifespan, WebSocket /ws/logs, /health
 │   ├── routers/
 │   │   ├── pipeline.py         # POST /pipeline/start|stop, GET /pipeline/status
 │   │   ├── reparador.py        # POST /reparador/start|stop, GET /reparador/status
@@ -77,19 +77,26 @@ datacorpus-code/
 │   │   └── maintenance.py      # POST /maintenance/rebuild-faiss/{modo}
 │   └── services/
 │       ├── log_manager.py      # Captura de stdout + broadcast a WebSocket
-│       └── runner.py           # FlowRunner con parada controlada via threading.Event
-├── config.py                   # DB_CONFIG, claves API, nombres de modelos, rutas FAISS, TEMAS_VALIDOS
-├── setup.sql                   # DROP + CREATE de las 4 tablas
-├── views.sql                   # 7 vistas PostgreSQL para el dashboard
-├── data_shield.py              # Clase DataShield - deduplicación de chunks con FAISS
-├── query_shield.py             # Clase QueryShield - deduplicación de queries con FAISS
-├── generar_queries.py          # Generación de preguntas con LLM + validación
-├── scrapear_queries.py         # Brave Search + scraping + procesamiento de chunks
-├── flujo_reparador.py          # Flujo de reparación (2 sub-flujos)
-├── ejecutar_todo.py            # Orquestador principal del pipeline
-├── rebuild_faiss.py            # Reconstrucción de índices FAISS desde la DB
-├── queries_validadas.jsonl     # Archivo intermedio entre generación y scraping
-└── test_reparador.py           # Script temporal para simulación del flujo reparador
+│       ├── runner.py           # FlowRunner con bucle y parada controlada
+│       └── shields.py          # Singletons de QueryShield y DataShield
+├── core/                       # Lógica del pipeline
+│   ├── config.py               # DB_CONFIG, claves API, modelos, rutas FAISS, TEMAS_VALIDOS
+│   ├── data_shield.py          # DataShield — deduplicación de chunks con FAISS
+│   ├── query_shield.py         # QueryShield — deduplicación de queries con FAISS
+│   ├── generar_queries.py      # Generación de preguntas con LLM + validación
+│   ├── scrapear_queries.py     # Brave Search + scraping + procesamiento de chunks
+│   ├── flujo_reparador.py      # Flujo de reparación (2 sub-flujos)
+│   ├── pipeline.py             # Orquestador principal (run_pipeline)
+│   └── rebuild_faiss.py        # Reconstrucción de índices FAISS desde la BD
+├── db/                         # Scripts SQL
+│   ├── setup.sql               # DROP + CREATE de las 4 tablas
+│   └── views.sql               # 7 vistas para el dashboard
+├── data/                       # Datos de ejecución (gitignored)
+│   ├── faiss/                  # Índices FAISS (.bin + .mapping)
+│   └── queries_validadas.jsonl # Archivo intermedio entre generación y scraping
+├── tests/
+│   └── test_reparador.py       # Simulación de estados para el flujo reparador
+└── README.md
 ```
 
 ---
@@ -202,52 +209,55 @@ venv\Scripts\activate           # Windows
 pip install -r requirements.txt
 ```
 
-### 3. Configurar `config.py`
+### 3. Configurar `core/config.py`
 
-Editar el archivo `config.py` con los valores del entorno:
+Editar `core/config.py` con los valores del entorno:
 
 ```python
 DB_CONFIG = {
-    "host": "localhost",
-    "dbname": "datacorpus",
-    "user": "usuario",
+    "host":     "localhost",
+    "dbname":   "datacorpus",
+    "user":     "usuario",
     "password": "contraseña",
 }
 
 TOGETHER_API_KEY = "..."
 BRAVE_API_KEY    = "..."
-
-FAISS_QUERIES_PATH = "faiss_queries.bin"
-FAISS_DOCS_PATH    = "faiss_docs.bin"
 ```
+
+Las rutas FAISS y el archivo JSONL se configuran automáticamente en `data/faiss/` y `data/` respectivamente.
 
 ### 4. Crear las tablas
 
 ```bash
-psql -U usuario -d datacorpus -f setup.sql
+psql -U usuario -d datacorpus -f db/setup.sql
 ```
 
 ### 5. Crear las vistas del dashboard
 
 ```bash
-psql -U usuario -d datacorpus -f views.sql
+psql -U usuario -d datacorpus -f db/views.sql
 ```
 
 ### 6. Iniciar el servidor API
 
 ```bash
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
+
+Al arrancar, el servidor carga automáticamente los modelos de IA (QueryShield y DataShield). Los endpoints `/pipeline/start` y `/reparador/start` retornan `503` hasta que la carga finaliza.
 
 ---
 
 ## Flujo principal del pipeline
 
-El orquestador `ejecutar_todo.py` ejecuta la función `run_pipeline()` que sigue estos pasos:
+El orquestador `core/pipeline.py` expone la función `run_pipeline()` que sigue estos pasos:
 
 ### Paso 1 — Carga de modelos
 
-Se instancian una vez `QueryShield` (modelo de queries, dim=384) y `DataShield` (modelo de documentos, dim=1024), cargando los índices FAISS desde disco.
+Cuando se usa vía API, los modelos se cargan una única vez al arrancar el servidor (lifespan de FastAPI) y se reutilizan en cada ejecución. Cuando se ejecuta por terminal, se cargan al inicio de `run_pipeline()`.
+
+`QueryShield` usa el modelo MiniLM (dim=384) y `DataShield` usa BGE-M3 (dim=1024). Ambos cargan sus índices FAISS desde `data/faiss/`.
 
 ### Paso 2 — Generación de preguntas (`generar_queries.py`)
 
@@ -354,26 +364,48 @@ Verifica el estado del servidor y de los flujos activos.
 
 ### Endpoints del pipeline
 
-#### `POST /pipeline/start`
+#### `POST /pipeline/start?iterations=N`
 
 Inicia el pipeline principal en un hilo en segundo plano.
 
-- No acepta cuerpo.
-- Retorna error si el pipeline o el reparador ya están en ejecución.
+| Parámetro | Tipo | Por defecto | Descripción |
+|---|---|---|---|
+| `iterations` | int (query) | `null` | Número de iteraciones. Sin valor = bucle infinito hasta `/stop` |
 
-#### `POST /pipeline/stop`
+- Retorna `409` si el pipeline o el reparador ya están en ejecución.
+- Retorna `503` si los modelos todavía no se han cargado.
 
-Solicita una parada controlada (graceful stop). El pipeline termina el ciclo de la query actual y luego se detiene.
+**Ejemplos:**
+```bash
+# Bucle infinito (para el servicio de Linux)
+POST /pipeline/start
 
-#### `GET /pipeline/status`
-
-Retorna el estado actual del pipeline.
+# Ejecutar exactamente 5 veces
+POST /pipeline/start?iterations=5
+```
 
 **Respuesta:**
 ```json
 {
-  "flow": "pipeline",
-  "status": "idle"
+  "started": true,
+  "status": "running",
+  "max_iterations": 5,
+  "modo": "5 iteraciones"
+}
+```
+
+#### `POST /pipeline/stop`
+
+Solicita una parada controlada. El pipeline termina la query actual y se detiene. El status pasa a `stopping` hasta que el hilo finaliza, luego vuelve a `idle`.
+
+#### `GET /pipeline/status`
+
+```json
+{
+  "flow": "PIPELINE",
+  "status": "running",
+  "iteration": 3,
+  "max_iterations": 5
 }
 ```
 
@@ -385,18 +417,22 @@ Los valores posibles de `status` son: `idle`, `running`, `stopping`.
 
 #### `POST /reparador/start`
 
-Inicia el flujo de reparación manualmente en segundo plano.
+Inicia el flujo de reparación manualmente en segundo plano. Se ejecuta **una sola vez** y termina solo (no hace bucle).
+
+- Retorna `409` si el pipeline principal está en ejecución.
+- Retorna `503` si los modelos todavía no se han cargado.
 
 #### `POST /reparador/stop`
 
-Solicita parada controlada del reparador.
+Solicita parada controlada. Útil si la reparación tiene muchos casos y se quiere interrumpir a mitad.
 
 #### `GET /reparador/status`
 
 ```json
 {
-  "flow": "reparador",
-  "status": "idle"
+  "flow": "REPARADOR",
+  "status": "idle",
+  "iteration": 1
 }
 ```
 
@@ -517,19 +553,30 @@ La clase `FlowRunner` gestiona la ejecución de un único flujo a la vez.
 
 **Métodos principales:**
 
-| Método | Descripción |
-|---|---|
-| `start(fn)` | Lanza `fn` en un hilo daemon, captura stdout, establece status=RUNNING |
-| `stop()` | Activa `threading.Event` (stop_event), establece status=STOPPING |
+| Método | Parámetros | Descripción |
+|---|---|---|
+| `start(fn, max_iterations, **kwargs)` | `fn`: función a ejecutar; `max_iterations`: límite de iteraciones (None = infinito) | Lanza `fn` en un hilo daemon dentro de un bucle, captura stdout |
+| `stop()` | — | Activa `threading.Event`, establece status=STOPPING |
 
-**Control de parada:**
-El flujo verifica `stop_event.is_set()` entre cada query o iteración. Cuando detecta la señal, termina el ciclo actual y sale limpiamente. Al completarse el hilo, el status vuelve a `IDLE`.
+**Bucle de ejecución:**
 
-**Singletons disponibles:**
-- `pipeline_runner` — para el flujo principal
-- `reparador_runner` — para el flujo de reparación
+```
+while not stop_event.is_set():
+    ejecutar fn(stop_event, **kwargs)
+    si se alcanzaron max_iterations → salir
+```
 
-**Exclusión mutua:** el pipeline y el reparador no pueden ejecutarse simultáneamente. Si uno está activo, el intento de iniciar el otro retorna un error `409 Conflict`.
+El flujo verifica `stop_event.is_set()` al inicio de cada iteración y en puntos clave internos (entre queries, entre casos del reparador). Cuando detecta la señal, termina el ciclo actual y sale limpiamente.
+
+**Singletons:**
+- `pipeline_runner` — bucle infinito o N iteraciones según parámetro
+- `reparador_runner` — siempre `max_iterations=1` (una sola ejecución)
+
+**Exclusión mutua:** pipeline y reparador no pueden ejecutarse simultáneamente. El intento de iniciar uno mientras el otro está activo retorna `409 Conflict`.
+
+**Carga de modelos (`api/services/shields.py`):**
+
+Los singletons `QueryShield` y `DataShield` se cargan una única vez en el `lifespan` de FastAPI mediante `asyncio.run_in_executor` (no bloquea el event loop). Se pasan directamente a cada ejecución del flujo, evitando recargar los modelos en cada iteración del bucle.
 
 ---
 
@@ -565,7 +612,7 @@ curl -X POST http://localhost:8000/pipeline/stop
 
 ## Vistas SQL del dashboard
 
-El archivo `views.sql` define 7 vistas que encapsulan las consultas del dashboard:
+El archivo `db/views.sql` define 7 vistas que encapsulan las consultas del dashboard:
 
 | Vista | Descripción |
 |---|---|

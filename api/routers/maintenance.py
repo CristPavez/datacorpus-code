@@ -10,9 +10,7 @@ _rebuild_running = False
 
 def _run_rebuild(modo: str):
     global _rebuild_running
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-    from rebuild_faiss import rebuild_docs_faiss, rebuild_queries_faiss
+    from core.rebuild_faiss import rebuild_docs_faiss, rebuild_queries_faiss
 
     log_manager.start_capture()
     try:

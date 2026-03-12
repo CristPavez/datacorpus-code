@@ -2,9 +2,7 @@ import psycopg
 from fastapi import APIRouter, HTTPException
 from pgvector.psycopg import register_vector
 
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from config import DB_CONFIG
+from core.config import DB_CONFIG
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 

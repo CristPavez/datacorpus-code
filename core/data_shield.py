@@ -31,7 +31,7 @@ from typing import Optional
 from pgvector.psycopg import register_vector
 from sentence_transformers import SentenceTransformer
 from nltk.tokenize import sent_tokenize
-from config import (MODEL_DOCS, MODEL_MAX_LENGTH,
+from .config import (MODEL_DOCS, MODEL_MAX_LENGTH,
                     FAISS_DOCS_DIM, FAISS_DOCS_HNSW_M, FAISS_DOCS_PATH)
 
 nltk.download('punkt_tab', quiet=True)

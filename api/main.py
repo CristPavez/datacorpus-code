@@ -23,13 +23,21 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from .services.log_manager import log_manager
+from .services import shields
 from .routers import pipeline, reparador, dashboard, maintenance
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Registrar el event loop del servidor para que log_manager pueda usarlo
-    log_manager.set_loop(asyncio.get_event_loop())
+    loop = asyncio.get_event_loop()
+    log_manager.set_loop(loop)
+
+    print("\n   Iniciando DataCorpus API — cargando modelos de IA...")
+    try:
+        await loop.run_in_executor(None, shields.load)
+    except Exception:
+        print("   ⚠️  Los modelos no se cargaron. Los flujos no estarán disponibles.")
+
     yield
 
 
@@ -72,8 +80,10 @@ async def ws_logs(websocket: WebSocket):
 @app.get("/health", tags=["Sistema"])
 def health():
     from .services.runner import pipeline_runner, reparador_runner
+    models = shields.status()
     return {
-        "ok":       True,
-        "pipeline": pipeline_runner.status,
+        "ok":        models["loaded"],
+        "modelos":   models,
+        "pipeline":  pipeline_runner.status,
         "reparador": reparador_runner.status,
     }

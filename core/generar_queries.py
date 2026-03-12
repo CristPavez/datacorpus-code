@@ -22,8 +22,8 @@ import random
 import psycopg
 from typing import Optional
 from openai import OpenAI
-from query_shield import QueryShield, Estado
-from config import (DB_CONFIG, TOGETHER_API_KEY, TEMAS_VALIDOS,
+from .query_shield import QueryShield, Estado
+from .config import (DB_CONFIG, TOGETHER_API_KEY, TEMAS_VALIDOS,
                     QUERIES_FILE, es_pregunta_valida)
 
 # ── Configuración ────────────────────────────────────────────────

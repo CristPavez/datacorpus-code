@@ -38,7 +38,7 @@ logging.getLogger('sentence_transformers').setLevel(logging.ERROR)
 
 import time
 import psycopg
-from config import DB_CONFIG
+from .config import DB_CONFIG
 
 MAX_VACIOS_POR_RUN   = 20
 MAX_FALLIDOS_POR_RUN = 20
@@ -97,8 +97,8 @@ def reparar_vacio(vacio: dict, dshield, qshield) -> bool:
     Limpia documents_logs huérfanos antes de intentarlo.
     Si tiene éxito guarda el documento. Si falla loguea el estado final.
     """
-    from scrapear_queries import buscar_brave, extraer_contenido, procesar_chunks_url
-    from data_shield import DataShield
+    from .scrapear_queries import buscar_brave, extraer_contenido, procesar_chunks_url
+    from .data_shield import DataShield
 
     uuid_original = vacio["uuid"]
     pregunta      = vacio["pregunta"]
@@ -240,9 +240,9 @@ def reparar_duplicada_similar(fallido: dict, qshield, dshield) -> bool:
     → Valida con QueryShield forzando el UUID original.
     → Si pasa, inserta en queries y scrapea.
     """
-    from generar_queries import generar_preguntas_lm, validar_y_procesar
-    from scrapear_queries import buscar_brave, extraer_contenido, procesar_chunks_url
-    from data_shield import DataShield
+    from .generar_queries import generar_preguntas_lm, validar_y_procesar
+    from .scrapear_queries import buscar_brave, extraer_contenido, procesar_chunks_url
+    from .data_shield import DataShield
 
     uuid_original = fallido["uuid"]
     tema          = fallido["tema"]
@@ -286,8 +286,8 @@ def reparar_sin_resultados_omitida(fallido: dict, qshield, dshield) -> bool:
     → Scrapea con pregunta alternativa, guarda documento con UUID original.
     → La entrada en queries NO se modifica (embedding del original intacto).
     """
-    from generar_queries import generar_preguntas_lm
-    from data_shield import DataShield
+    from .generar_queries import generar_preguntas_lm
+    from .data_shield import DataShield
 
     uuid_original = fallido["uuid"]
     tema          = fallido["tema"]
@@ -310,8 +310,8 @@ def _scrapear_y_guardar(uuid_original: str, pregunta_busqueda: str,
     Lógica común de scraping para ambos casos del flujo 2.
     Usa siempre el UUID original para guardar.
     """
-    from scrapear_queries import buscar_brave, extraer_contenido, procesar_chunks_url
-    from data_shield import DataShield
+    from .scrapear_queries import buscar_brave, extraer_contenido, procesar_chunks_url
+    from .data_shield import DataShield
 
     urls = buscar_brave(pregunta_busqueda)
     if not urls:
@@ -403,8 +403,8 @@ def ejecutar_reprocesamiento_fallidos(qshield, dshield, stop_event=None):
 # ══════════════════════════════════════════════════════════════════
 
 def ejecutar_flujo_reparador(qshield=None, dshield=None, stop_event=None):
-    from query_shield import QueryShield
-    from data_shield  import DataShield
+    from .query_shield import QueryShield
+    from .data_shield  import DataShield
 
     print("\n" + "="*70)
     print("FLUJO REPARADOR".center(70))
@@ -428,9 +428,11 @@ def ejecutar_flujo_reparador(qshield=None, dshield=None, stop_event=None):
     print("="*70 + "\n")
 
 
-def run_reparador(stop_event=None):
-    """Punto de entrada para la API FastAPI."""
-    ejecutar_flujo_reparador(stop_event=stop_event)
+def run_reparador(stop_event=None, qshield=None, dshield=None):
+    """Punto de entrada para la API FastAPI.
+    qshield y dshield se pasan ya cargados desde el lifespan del servidor.
+    """
+    ejecutar_flujo_reparador(qshield=qshield, dshield=dshield, stop_event=stop_event)
 
 
 if __name__ == "__main__":
