@@ -50,7 +50,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # ajustar en producción
+    allow_origins=[
+        "http://datacorpus.tail78f56e.ts.net:3000",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
