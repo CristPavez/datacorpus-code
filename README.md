@@ -2,7 +2,7 @@
 
 Constructor automático de corpus en español de alta calidad. Genera preguntas técnicas con LLM, busca contenido en la web, lo extrae y deduplica semánticamente usando FAISS y pgvector.
 
----
+--- 
 
 ## Tabla de contenidos
 
