@@ -26,39 +26,23 @@ def _query(sql: str, params=()) -> list[dict]:
 
 @router.get("/resumen", summary="Resumen general del corpus")
 def resumen():
-    rows = _query("SELECT * FROM v_resumen")
+    rows = _query("SELECT * FROM v_resumen_totales")
     return rows[0] if rows else {}
 
 
-@router.get("/temas", summary="Queries aprobadas por tema")
+@router.get("/estados", summary="Distribución de estados en documents_logs y queries_logs")
+def estados():
+    return _query("SELECT * FROM v_estados_resumen")
+
+
+@router.get("/temas", summary="Queries por tema")
 def temas():
     return _query("SELECT * FROM v_queries_por_tema")
 
 
-@router.get("/estados-queries", summary="Distribución de estados en queries_logs")
-def estados_queries():
-    return _query("SELECT * FROM v_estados_queries")
-
-
-@router.get("/estados-chunks", summary="Distribución de estados en documents_logs")
-def estados_chunks():
-    return _query("SELECT * FROM v_estados_chunks")
-
-
-@router.get("/actividad", summary="Actividad diaria por estado")
-def actividad():
-    return _query("SELECT * FROM v_actividad_diaria LIMIT 90")
-
-
-@router.get("/tasa-exito", summary="Tasa de éxito por tema")
-def tasa_exito():
-    return _query("SELECT * FROM v_tasa_exito_temas")
-
-
-@router.get("/ultimas-queries", summary="Últimas 50 queries aprobadas")
+@router.get("/ultimas-queries", summary="Últimas queries generadas")
 def ultimas_queries():
     rows = _query("SELECT * FROM v_ultimas_queries")
-    # Convertir UUID a string para serialización
     for r in rows:
         if "uuid" in r:
             r["uuid"] = str(r["uuid"])

@@ -12,7 +12,7 @@ DB_CONFIG = {
     "dbname":   "datacorpus_bd_test",
     "user":     "datacorpus",
     "password": "730822",
-    "host":     "100.116.167.76",
+    "host":     "localhost",
 }
 
 # ── API KEYS ──────────────────────────────────────────────────────
