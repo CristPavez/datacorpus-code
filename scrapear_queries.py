@@ -1,61 +1,49 @@
 #!/usr/bin/env python3
-import json, uuid, time, requests, psycopg
-from bs4 import BeautifulSoup
-from urllib.parse import quote_plus, urlparse, parse_qs, unquote
+"""
+DataCorpus — Scraper inteligente de queries.
+
+Flujo por query:
+  1. Buscar 3 URLs en Brave Search
+  2. Por cada URL: extraer contenido → chunkear con NLTK
+  3. Validar cada chunk con FAISS (DataShield):
+       score == 1.0          → DUPLICADA (cuenta para umbral 50%)
+       score >= 0.90 < 1.0   → LLM decide → SIMILAR (cuenta) o APROBADO
+       score < 0.90          → APROBADO
+  4. Si al procesar se alcanza 50% de chunks rechazados → stop, resto = OMITIDA
+     → descartar URL, probar siguiente
+  5. Si todas las URLs son descartadas → query OMITIDA en queries_logs
+  6. Si ninguna URL tiene contenido   → query SIN_RESULTADOS en queries_logs
+  7. Si se aprueba una URL → guardar documents + documents_logs + queries
+"""
+
+import json
+import time
+import psycopg
+import requests
+from urllib.parse import urlparse, parse_qs, unquote
 from openai import OpenAI
-from data_shield import DataShield, Estado
+from data_shield import DataShield, ResultadoChunk
 from query_shield import QueryShield
+from config import DB_CONFIG, BRAVE_API_KEY, TOGETHER_API_KEY, QUERIES_FILE
 
-DB_CONFIG = {
-    "dbname": "datacorpus_bd",
-    "user": "datacorpus",
-    "password": "730822",
-    "host": "localhost"
-}
 
-# ── BRAVE SEARCH API ──────────────────────────────────────────────
-# Coloca aquí tu API key de Brave Search
-BRAVE_API_KEY = "BSA9TKRCDdLxynAieJYPeqx6A1BPcLH"
+# ── Cliente LLM ──────────────────────────────────────────────────
+def get_llm_client() -> OpenAI:
+    return OpenAI(api_key=TOGETHER_API_KEY, base_url="https://api.together.xyz/v1")
 
-# ── TOGETHER AI API ───────────────────────────────────────────────
-# API key para el modelo DeepSeek V3
-TOGETHER_API_KEY = "tgp_v1_35Ewiz4u1GT4huetCkSeITDZ9eyw-6tNcuYlSn5X7lY"
 
-def log_error_general(mensaje):
-    import psycopg
-    from datetime import datetime
-    try:
-        conn = psycopg.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO logs_error (mensaje, fecha)
-            VALUES (%s, %s)
-        """, (mensaje, datetime.now()))
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception as e:
-        print(f"[ERROR] No se pudo registrar en logs_error: {e}")
-
-def leer_queries():
-    with open("queries_validadas.jsonl", encoding="utf-8") as f:
-        return [json.loads(l) for l in f]
-
-def buscar_brave(query: str, max_results=3):
-    """
-    Busca usando la API de Brave Search.
-    Incluye reintentos con backoff exponencial en caso de rate limit (429).
-    """
-    url = "https://api.search.brave.com/res/v1/web/search"
+# ── Brave Search ──────────────────────────────────────────────────
+def buscar_brave(query: str, max_results: int = 3) -> list[dict]:
+    """Retorna lista de {'url': ...}. Reintentos con backoff en 429."""
+    url     = "https://api.search.brave.com/res/v1/web/search"
     headers = {
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
-        "X-Subscription-Token": BRAVE_API_KEY
+        "X-Subscription-Token": BRAVE_API_KEY,
     }
     params = {
-        "q": query,
-        "count": max_results,
-        "search_lang": "es",
-        "country": "es"
+        "q": query, "count": max_results,
+        "search_lang": "es", "country": "es",
     }
 
     for intento in range(3):
@@ -63,255 +51,228 @@ def buscar_brave(query: str, max_results=3):
             resp = requests.get(url, headers=headers, params=params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-
             results = []
             if "web" in data and "results" in data["web"]:
                 for item in data["web"]["results"][:max_results]:
-                    results.append({'url': item.get('url', '')})
-
-            if not results:
-                print(f"      ⚠️  No se encontraron resultados para la query: {query}")
-
+                    results.append({"url": item.get("url", "")})
             return results
-
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
-                espera = 2 ** intento  # 1s, 2s, 4s
-                print(f"      ⚠️  Rate limit (429). Reintentando en {espera}s... ({intento + 1}/3)")
+                espera = 2 ** intento
+                print(f"      ⚠️  Rate limit. Reintentando en {espera}s...")
                 time.sleep(espera)
                 continue
-            elif e.response.status_code == 401:
-                print(f"      ⚠️  Error de autenticación: Verifica tu BRAVE_API_KEY")
-                return []
-            else:
-                print(f"      ⚠️  Error HTTP {e.response.status_code}: {e}")
-                return []
+            print(f"      ⚠️  HTTP {e.response.status_code}: {e}")
+            return []
         except Exception as e:
-            print(f"      ⚠️  Error buscando en Brave Search: {e}")
+            print(f"      ⚠️  Error Brave Search: {e}")
             return []
 
-    print(f"      ⚠️  Sin resultados tras 3 intentos (rate limit persistente)")
     return []
 
 
-def extraer_contenido(url: str):
+# ── Extracción de contenido ───────────────────────────────────────
+def extraer_contenido(url: str) -> str | None:
     try:
         import trafilatura
-        if url.startswith('//'): url = 'https:' + url
+        if url.startswith('//'):
+            url = 'https:' + url
         if 'duckduckgo.com/l/' in url:
             params = parse_qs(urlparse(url).query)
             url = unquote(params['uddg'][0]) if 'uddg' in params else url
         downloaded = trafilatura.fetch_url(url)
         return trafilatura.extract(downloaded) if downloaded else None
     except Exception as e:
-        print(f"      ⚠️  Error extrayendo contenido de {url[:60]}: {e}")
+        print(f"      ⚠️  Error extrayendo {url[:60]}: {e}")
         return None
 
-def decidir_con_llm(chunk_nuevo: str, chunk_existente: str) -> bool:
+
+# ── Decisión LLM para chunk en zona AGENTE ────────────────────────
+def decidir_chunk_llm(chunk_nuevo: str, chunk_existente: str) -> bool:
     """
-    Evalúa si el chunk nuevo aporta valor informativo adicional 
-    comparado con el chunk existente, incluso si el tema es el mismo.
-    Retorna True si el chunk nuevo aporta información diferente (GUARDAR).
-    Retorna False si es redundante (RECHAZAR).
+    Retorna True si el chunk nuevo aporta información diferente (APROBADO).
+    Retorna False si es redundante (SIMILAR).
     """
     try:
-        # Usamos un prompt de "Novedad Informativa" en lugar de similitud simple
         prompt_sistema = (
             "Actúa como un analista de datos. Tu objetivo es identificar si un texto nuevo "
             "aporta información, métricas, pasos de proceso o conceptos que NO están en el texto existente."
         )
-        
         prompt_usuario = (
             f"Texto Existente: \"\"\"{chunk_existente[:1500]}\"\"\"\n\n"
             f"Texto Nuevo: \"\"\"{chunk_nuevo[:1500]}\"\"\"\n\n"
-            "Analiza: ¿El 'Texto Nuevo' contiene algún detalle específico, entidad o matiz que no esté en el 'Texto Existente'?\n"
+            "Analiza: ¿El 'Texto Nuevo' contiene algún detalle específico, entidad o matiz "
+            "que no esté en el 'Texto Existente'?\n"
             "Responde únicamente: 'NUEVO' si aporta algo diferente, o 'DUPLICADO' si es redundante."
         )
-
-        client = OpenAI(api_key=TOGETHER_API_KEY, base_url="https://api.together.xyz/v1")
-        resp = client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-V3",  # Excelente elección por su razonamiento
+        resp = get_llm_client().chat.completions.create(
+            model="deepseek-ai/DeepSeek-V3",
             messages=[
                 {"role": "system", "content": prompt_sistema},
-                {"role": "user", "content": prompt_usuario}
+                {"role": "user",   "content": prompt_usuario},
             ],
-            max_tokens=10, 
-            temperature=0.0  # Importante: Queremos determinismo total
+            max_tokens=10,
+            temperature=0.0,
         )
-        
         resultado = resp.choices[0].message.content.strip().upper()
-        
-        # Logica: Si el LLM dice que es NUEVO, retornamos True para guardar
-        es_nuevo = "NUEVO" in resultado
-        return es_nuevo
-        
+        return "NUEVO" in resultado
     except Exception as e:
-        print(f"      ⚠️  Error en validación LLM: {e}")
-        # En caso de error, es mejor GUARDAR (True) para no perder datos por un fallo de API
-        return True
+        print(f"      ⚠️  Error LLM chunk: {e} — conservando (APROBADO)")
+        return True  # Conservador: no perder datos por fallo de API
 
 
-def main(dshield_externo=None, qshield_externo=None):
+# ── Procesamiento de chunks con umbral 50% ────────────────────────
+def procesar_chunks_url(dshield: DataShield, chunks: list[str]) -> list[ResultadoChunk]:
     """
-    Args:
-        dshield_externo: DataShield pre-inicializado (para evitar recargar modelo)
-        qshield_externo: QueryShield pre-inicializado (para evitar recargar modelo)
+    Procesa chunks uno a uno.
+    En cuanto se alcanza 50% de rechazados, los restantes son OMITIDA.
+    Retorna la lista completa de ResultadoChunk.
     """
-    queries = leer_queries()
-    shield = dshield_externo if dshield_externo else DataShield(DB_CONFIG)
-    qshield = qshield_externo if qshield_externo else QueryShield(DB_CONFIG)
-    
-    print(f"   📊 Total de queries a procesar: {len(queries)}\n")
+    total     = len(chunks)
+    umbral    = total * DataShield.RECHAZO_UMBRAL
+    rechazados = 0
+    resultados = []
 
-    def procesar_query_guardar_query(query, shield, qshield, idx):
-        qid, qtexto, tema = query['id'], query['pregunta'], query['tema']
-        print(f"\n{'#'*70}")
-        print(f"Query {idx}/{len(queries)}")
-        print(f"{'#'*70}")
-        print(f"\n🔍 {qtexto[:80]}")
-        
-        resultados = buscar_brave(qtexto)
-        if not resultados:
-            print(f"   ⚠️  Sin resultados - Query omitida")
-            return
-        
-        print(f"   🎯 {len(resultados)} URLs encontradas\n")
-        
-        # Rastrear la mejor validación rechazada para registrar en logs si todas fallan
-        mejor_rechazo = None
-        
-        for idx, r in enumerate(resultados):
-            url = r['url']
-            print(f"   🔗 URL {idx+1}: {url[:65]}{'...' if len(url) > 65 else ''}")
-            
-            contenido = extraer_contenido(url)
-            if not contenido:
-                print(f"      ❌ No se pudo extraer contenido\n")
-                continue
-            
-            print(f"      📏 Contenido extraído: {len(contenido)} chars")
-            
-            if len(contenido) < 100:
-                print(f"      ⚠️  Contenido muy corto (<100 chars)\n")
-                continue
+    for i, chunk in enumerate(chunks):
+        # ¿Ya se alcanzó el umbral?
+        if rechazados >= umbral:
+            # Resto = OMITIDA
+            for j in range(i, total):
+                resultados.append(ResultadoChunk(
+                    chunk_numero=j, chunk_text=chunks[j], estado="OMITIDA",
+                    score=0.0, uuid_chunk_similar=None,
+                    chunk_numero_similar=None, embedding=None
+                ))
+            break
 
-            doc_id = qid  # Usar el uuid del JSONL
-            val = shield.validar(doc_id, contenido)
-            
-            # Construir mensaje de estado con colores
-            if val.estado == Estado.NUEVA:
-                icono = "✅"
-                estado_msg = f"🎯 NUEVO"
-            elif val.estado == Estado.AGENTE:
-                icono = "🟡"
-                estado_msg = f"⚠️  AGENTE (score: {val.score:.3f})"
+        emb = dshield.embed(chunk)
+        uuid_sim, num_sim, score = dshield.buscar_similar(emb)
+
+        if score >= DataShield.DUPLICADA_THRESHOLD:
+            estado = "DUPLICADA"
+            rechazados += 1
+            print(f"         Chunk #{i} score={score:.3f} → DUPLICADA")
+
+        elif score >= DataShield.AGENT_ZONE_LOW:
+            # Zona AGENTE → LLM
+            chunk_hist = dshield.get_chunk_text(uuid_sim, num_sim) if uuid_sim else ""
+            print(f"         Chunk #{i} score={score:.3f} → LLM...", end=" ")
+            es_diferente = decidir_chunk_llm(chunk, chunk_hist)
+            if es_diferente:
+                estado = "APROBADO"
+                print("APROBADO")
             else:
-                icono = "❌"
-                estado_msg = f"❌ {val.estado.value.upper()}"
-            
-            print(f"      {icono} {estado_msg}")
-            print(f"      📄 {val.razon}")
+                estado = "SIMILAR"
+                rechazados += 1
+                print("SIMILAR")
 
-            if val.estado == Estado.NUEVA:
-                shield.agregar(doc_id, contenido, tema, url, "APROBADO")
-                print("      💾 Documento guardado")
-                qshield.agregar(doc_id, qtexto, tema)
-                print("      📝 Query registrada en BD")
-                print(f"      ✅ APROBADO - Finalizando query\n")
-                return  # ✅ Salir si se aprueba
+        else:
+            estado = "APROBADO"
 
-            elif val.estado == Estado.DUPLICADO:
-                shield.agregar_solo_logs(doc_id, contenido, url, "RECHAZADO", val.bloques_detalle)
-                print("      ⏭️  Probando siguiente URL...\n")
-                # Guardar info para registrar en logs si todas las URLs fallan
-                if not mejor_rechazo or val.score > mejor_rechazo['val'].score:
-                    mejor_rechazo = {'val': val, 'estado': 'DUPLICADO'}
-                continue  # Pasar a la siguiente URL
+        resultados.append(ResultadoChunk(
+            chunk_numero=i, chunk_text=chunk, estado=estado,
+            score=score, uuid_chunk_similar=uuid_sim,
+            chunk_numero_similar=num_sim, embedding=emb
+        ))
 
-            elif val.estado == Estado.AGENTE:
-                # Validar TODOS los chunks en zona AGENTE con LLM
-                chunks_agente = [b for b in val.bloques_detalle if b["estado"] == "AGENTE"]
-                print(f"      🧠 Validando {len(chunks_agente)} chunk(s) en zona AGENTE con LLM...")
+    return resultados
 
-                # Obtener el texto original dividido en chunks para acceder a los textos nuevos
-                bloques_originales = shield._split_text(contenido)
 
-                chunks_rechazados = 0
+# ── Procesar una query ────────────────────────────────────────────
+def procesar_query(query: dict, dshield: DataShield, qshield: QueryShield,
+                   idx: int, total: int):
+    qid     = query["id"]
+    qtexto  = query["pregunta"]
+    tema    = query["tema"]
 
-                for bloque in chunks_agente:
-                    idx_chunk = bloque["indice"]
-                    chunk_nuevo = bloques_originales[idx_chunk] if idx_chunk < len(bloques_originales) else ""
-                    chunk_hist = ""
+    print(f"\n{'#'*70}")
+    print(f"Query {idx}/{total}")
+    print(f"{'#'*70}")
+    print(f"\n  {qtexto[:80]}")
 
-                    # Obtener chunk histórico de BD (con cierre garantizado)
-                    if bloque.get("uuid_historico"):
-                        conn = None
-                        try:
-                            conn = psycopg.connect(**DB_CONFIG)
-                            cur = conn.cursor()
-                            cur.execute(
-                                "SELECT chunk FROM documents_logs WHERE uuid=%s AND chunk_numero=%s",
-                                (bloque["uuid_historico"], bloque["chunk_num_historico"])
-                            )
-                            row = cur.fetchone()
-                            chunk_hist = row[0] if row else ""
-                            cur.close()
-                        except Exception as e:
-                            print(f"         ⚠️  Error obteniendo chunk histórico: {e}")
-                        finally:
-                            if conn:
-                                conn.close()
+    # ── 1. Buscar URLs ─────────────────────────────────────────────
+    urls = buscar_brave(qtexto)
+    if not urls:
+        print(f"   ⚠️  Sin resultados de búsqueda")
+        qshield.log(qid, qtexto, 0.0, None, "SIN_RESULTADOS", tema)
+        return
 
-                    # Validar con LLM
-                    print(f"         🔄 Chunk #{idx_chunk} (score: {bloque['score']:.3f})...", end=" ")
-                    decision_llm = decidir_con_llm(chunk_nuevo, chunk_hist)
+    print(f"   {len(urls)} URL(s) encontradas\n")
 
-                    if decision_llm:  # TRUE → NUEVO
-                        print("✅ DIFERENTE")
-                    else:  # FALSE → DUPLICADO
-                        print("❌ DUPLICADO")
-                        chunks_rechazados += 1
+    hubo_contenido  = False   # alguna URL tuvo texto extraíble
+    url_aprobada    = False   # alguna URL pasó el 50%
 
-                # Rechazar solo si más del 50% de chunks AGENTE son duplicados
-                aprobado_por_llm = chunks_rechazados < len(chunks_agente) / 2
+    for url_data in urls:
+        url = url_data["url"]
+        print(f"   URL: {url[:70]}{'...' if len(url) > 70 else ''}")
 
-                # Decisión final después de validar todos los chunks AGENTE
-                if aprobado_por_llm:
-                    shield.agregar(doc_id, contenido, tema, url, "APROBADO_LLM")
-                    print("      ✅ TODOS los chunks aprobados por LLM")
-                    print("      💾 Documento guardado")
-                    qshield.agregar(doc_id, qtexto, tema)
-                    print("      📝 Query registrada en BD")
-                    print(f"      ✅ APROBADO - Finalizando query\n")
-                    return  # ✅ Salir si LLM aprueba todos
-                else:
-                    shield.agregar_solo_logs(doc_id, contenido, url, "RECHAZADO_LLM", val.bloques_detalle)
-                    print("      🧠 LLM rechazó al menos 1 chunk → Documento rechazado")
-                    print("      ⏭️  Probando siguiente URL...\n")
-                    # Guardar info para registrar en logs si todas las URLs fallan
-                    if not mejor_rechazo or val.score > mejor_rechazo['val'].score:
-                        mejor_rechazo = {'val': val, 'estado': 'AGENTE'}
-                    continue  # Pasar a la siguiente URL
+        contenido = extraer_contenido(url)
+        if not contenido or len(contenido) < 100:
+            print(f"      ❌ Sin contenido extraíble\n")
+            continue
 
-        # Si llegamos aquí, ninguna URL fue aprobada
-        print("   ⚠️  Todas las URLs fueron rechazadas - Query sin contenido aprobado\n")
-        
-        # Registrar en logs de queries rechazadas con la mejor validación encontrada
-        if mejor_rechazo:
-            qshield.log_validacion(
-                doc_id, qtexto, 
-                mejor_rechazo['val'].bloque_match["uuid_historico"] if mejor_rechazo['val'].bloque_match else None, 
-                mejor_rechazo['estado'], 
-                mejor_rechazo['val'].score, 
-                "RECHAZADO_DOC", 
-                tema
-            )
+        hubo_contenido = True
+        print(f"      {len(contenido)} chars extraídos")
 
-    # Procesar todas las queries
+        chunks = dshield.split_text(contenido)
+        print(f"      {len(chunks)} chunks generados")
+
+        chunk_resultados = procesar_chunks_url(dshield, chunks)
+
+        # Calcular rechazo final
+        total_chunks   = len(chunks)
+        rechazados_tot = sum(
+            1 for c in chunk_resultados
+            if c.estado in ("DUPLICADA", "SIMILAR")
+        )
+        pct_rechazo = rechazados_tot / total_chunks if total_chunks else 0
+
+        print(f"      Rechazo: {rechazados_tot}/{total_chunks} ({pct_rechazo:.0%})")
+
+        if pct_rechazo >= DataShield.RECHAZO_UMBRAL:
+            print(f"      ❌ Umbral 50% alcanzado → URL descartada\n")
+            dshield.log_rechazado(qid, url, chunk_resultados)
+            continue
+
+        # ── URL aprobada ───────────────────────────────────────────
+        print(f"      ✅ URL aprobada → guardando documento...")
+        dshield.agregar(qid, contenido, tema, url, chunk_resultados)
+        qshield.agregar(qid, qtexto, tema)
+        qshield.log(qid, qtexto, 0.0, None, "APROBADO", tema)
+        url_aprobada = True
+        print(f"      Documento y query guardados\n")
+        break  # Con una URL aprobada es suficiente
+
+    # ── Resultado final de la query ────────────────────────────────
+    if not url_aprobada:
+        if hubo_contenido:
+            print(f"   ⚠️  Todas las URLs rechazadas por similitud → OMITIDA\n")
+            qshield.log(qid, qtexto, 0.0, None, "OMITIDA", tema)
+        else:
+            print(f"   ⚠️  Ninguna URL tuvo contenido extraíble → SIN_RESULTADOS\n")
+            qshield.log(qid, qtexto, 0.0, None, "SIN_RESULTADOS", tema)
+
+
+# ── MAIN ──────────────────────────────────────────────────────────
+def main(dshield_externo: DataShield = None, qshield_externo: QueryShield = None,
+         stop_event=None):
+    with open(QUERIES_FILE, encoding="utf-8") as f:
+        queries = [json.loads(l) for l in f]
+
+    dshield = dshield_externo or DataShield(DB_CONFIG)
+    qshield = qshield_externo or QueryShield(DB_CONFIG)
+    total   = len(queries)
+
+    print(f"   Total queries a procesar: {total}\n")
+
     for i, query in enumerate(queries, 1):
-        procesar_query_guardar_query(query, shield, qshield, i)
-        if i < len(queries):  # Pequeña pausa entre queries (excepto la última)
+        if stop_event and stop_event.is_set():
+            print(f"   ⏹️  Detención solicitada — scraping interrumpido en query {i}/{total}")
+            break
+        procesar_query(query, dshield, qshield, i, total)
+        if i < total:
             time.sleep(1)
+
 
 if __name__ == "__main__":
     main()

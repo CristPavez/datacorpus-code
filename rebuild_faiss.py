@@ -1,282 +1,101 @@
 #!/usr/bin/env python3
 """
-Script para reconstruir el índice FAISS desde la base de datos.
-Asegura sincronización completa entre BD y el índice de búsqueda.
+Reconstruye los índices FAISS desde la base de datos.
+Útil cuando el archivo .bin se corrompe o queda desincronizado.
+
+Índice de queries  → faiss_queries.bin  (dim=384, MiniLM)
+Índice de docs     → faiss_docs.bin     (dim=1024, BGE-M3)
 """
+
+import os, warnings, logging
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+warnings.filterwarnings('ignore')
+logging.getLogger('transformers').setLevel(logging.ERROR)
+logging.getLogger('sentence_transformers').setLevel(logging.ERROR)
 
 import faiss
 import numpy as np
 import psycopg
 import pickle
-from pathlib import Path
 from pgvector.psycopg import register_vector
-
-# ── CONFIGURACIÓN ─────────────────────────────────────────────────
-DB_CONFIG = {
-    "dbname": "datacorpus_bd",
-    "user": "datacorpus",
-    "password": "730822",
-    "host": "localhost"
-}
-
-FAISS_INDEX_PATH = Path("faiss_index_bge3.bin")
-FAISS_MAPPING_PATH = Path("faiss_index_bge3.mapping")
-VECTOR_DIMENSION = 1024  # Dimensión del modelo BAAI/bge-m3
+from config import (DB_CONFIG,
+                    FAISS_DOCS_PATH, FAISS_DOCS_MAPPING,
+                    FAISS_DOCS_DIM, FAISS_DOCS_HNSW_M,
+                    FAISS_QUERY_PATH, FAISS_QUERY_MAPPING,
+                    FAISS_QUERY_DIM, FAISS_QUERY_HNSW_M,
+                    MODEL_QUERY, MODEL_MAX_LENGTH)
 
 
-def get_connection():
-    """Crea conexión a la base de datos."""
+def get_conn():
     conn = psycopg.connect(**DB_CONFIG)
     register_vector(conn)
     return conn
 
 
-def contar_embeddings_disponibles():
-    """Cuenta cuántos embeddings válidos hay en la BD."""
-    conn = get_connection()
-    cur = conn.cursor()
-    
-    # Contar embeddings no nulos de chunks procesados
-    cur.execute("""
-        SELECT COUNT(*) 
-        FROM documents_logs 
-        WHERE chunk_embedding IS NOT NULL 
-        AND estado = 'procesado'
-    """)
-    count_procesados = cur.fetchone()[0]
-    
-    # Contar total de embeddings no nulos
-    cur.execute("""
-        SELECT COUNT(*) 
-        FROM documents_logs 
-        WHERE chunk_embedding IS NOT NULL
-    """)
-    count_total = cur.fetchone()[0]
-    
-    cur.close()
-    conn.close()
-    
-    return count_procesados, count_total
-
-
-def rebuild_faiss_index(solo_procesados=True, max_records=None):
+# ── FAISS de documentos ───────────────────────────────────────────
+def rebuild_docs_faiss():
     """
-    Reconstruye el índice FAISS desde cero usando la base de datos.
-    
-    Args:
-        solo_procesados: Si True, solo incluye chunks con estado='procesado'
-        max_records: Límite de registros a cargar (None = todos)
-    
-    Returns:
-        Tupla (índice FAISS, mapping list)
+    Reconstruye faiss_docs.bin desde documents_logs.
+    Mapping: [(documents_logs.id, chunk_numero), ...]
+    Solo chunks con estado = 'APROBADO'.
     """
-    print("🔄 Iniciando reconstrucción del índice FAISS...")
-    
-    conn = get_connection()
-    cur = conn.cursor()
-    
-    # Construir query según parámetros
-    where_clause = "WHERE chunk_embedding IS NOT NULL"
-    if solo_procesados:
-        where_clause += " AND estado = 'procesado'"
-    
-    limit_clause = f"LIMIT {max_records}" if max_records else ""
-    
-    query = f"""
-        SELECT uuid, chunk_numero, chunk_embedding 
-        FROM documents_logs 
-        {where_clause}
+    print("\n  Reconstruyendo FAISS de documentos (BGE-M3)...")
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT uuid, chunk_numero, embedding
+        FROM documents_logs
+        WHERE embedding IS NOT NULL
+          AND estado = 'APROBADO'
         ORDER BY id
-        {limit_clause}
-    """
-    
-    print(f"📊 Ejecutando query: {query}")
-    cur.execute(query)
+    """)
     rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    
+    cur.close(); conn.close()
+
     if not rows:
-        print("⚠️  No se encontraron embeddings en la base de datos")
-        return None, []
-    
-    print(f"✅ Encontrados {len(rows)} embeddings en la BD")
-    
-    # Crear nuevo índice FAISS
-    print(f"🔨 Creando índice FAISS (dim={VECTOR_DIMENSION})...")
-    index = faiss.IndexHNSWFlat(VECTOR_DIMENSION, 32)
-    mapping = []
-    embeddings_list = []
-    
-    # Procesar embeddings
-    print("📦 Procesando embeddings...")
-    for i, (doc_uuid, chunk_num, emb_raw) in enumerate(rows):
-        if i % 1000 == 0:
-            print(f"   Procesados: {i}/{len(rows)}")
-        
-        # Convertir y normalizar embedding
-        emb = np.array(emb_raw, dtype=np.float32)
-        faiss.normalize_L2(emb.reshape(1, -1))
-        
-        embeddings_list.append(emb.flatten())
-        mapping.append((str(doc_uuid), chunk_num))
-    
-    # Agregar todos los embeddings al índice
-    print("➕ Agregando embeddings al índice FAISS...")
-    embeddings_array = np.stack(embeddings_list).astype("float32")
-    index.add(embeddings_array)
-    
-    print(f"✅ Índice FAISS creado: {index.ntotal} vectores indexados")
-    
-    return index, mapping
+        print("  ⚠️  No hay chunks APROBADO con embedding. Creando índice vacío.")
+        index   = faiss.IndexHNSWFlat(FAISS_DOCS_DIM, FAISS_DOCS_HNSW_M)
+        mapping = []
+    else:
+        print(f"  {len(rows)} chunks encontrados")
+        index   = faiss.IndexHNSWFlat(FAISS_DOCS_DIM, FAISS_DOCS_HNSW_M)
+        mapping = []
+        embeddings = []
+
+        for doc_uuid, chunk_num, emb_raw in rows:
+            emb = np.array(emb_raw, dtype=np.float32)
+            faiss.normalize_L2(emb.reshape(1, -1))
+            embeddings.append(emb.flatten())
+            mapping.append((str(doc_uuid), int(chunk_num)))
+
+        index.add(np.stack(embeddings).astype("float32"))
+        print(f"  ✅ {index.ntotal} vectores indexados")
+
+    _guardar(index, mapping, FAISS_DOCS_PATH, FAISS_DOCS_MAPPING)
 
 
-def save_faiss_index(index, mapping, backup=True):
-    """
-    Guarda el índice FAISS y el mapping en disco.
-    
-    Args:
-        index: Índice FAISS
-        mapping: Lista de tuplas (uuid, chunk_numero)
-        backup: Si True, crea backup de archivos existentes
-    """
-    # Crear backup si existen archivos previos
-    if backup:
-        if FAISS_INDEX_PATH.exists():
-            backup_path = FAISS_INDEX_PATH.with_suffix(".bin.backup")
-            print(f"💾 Creando backup: {backup_path}")
-            FAISS_INDEX_PATH.rename(backup_path)
-        
-        if FAISS_MAPPING_PATH.exists():
-            backup_path = FAISS_MAPPING_PATH.with_suffix(".mapping.backup")
-            print(f"💾 Creando backup: {backup_path}")
-            FAISS_MAPPING_PATH.rename(backup_path)
-    
-    # Guardar nuevo índice
-    print(f"💾 Guardando índice FAISS: {FAISS_INDEX_PATH}")
-    faiss.write_index(index, str(FAISS_INDEX_PATH))
-    
-    print(f"💾 Guardando mapping: {FAISS_MAPPING_PATH}")
-    with open(FAISS_MAPPING_PATH, "wb") as f:
-        pickle.dump(mapping, f)
-    
-    print("✅ Archivos guardados exitosamente")
-
-
-def verificar_indice():
-    """Verifica que el índice guardado se pueda cargar correctamente."""
-    print("\n🔍 Verificando índice guardado...")
-    
-    try:
-        # Cargar índice
-        index = faiss.read_index(str(FAISS_INDEX_PATH))
-        with open(FAISS_MAPPING_PATH, "rb") as f:
-            mapping = pickle.load(f)
-        
-        print(f"✅ Índice cargado correctamente")
-        print(f"   - Vectores en índice: {index.ntotal}")
-        print(f"   - Entradas en mapping: {len(mapping)}")
-        
-        if index.ntotal == len(mapping):
-            print("✅ Sincronización correcta: índice y mapping coinciden")
-            return True
-        else:
-            print("⚠️  WARNING: El tamaño del índice y mapping no coinciden")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Error al verificar índice: {e}")
-        return False
-
-
-def mostrar_estadisticas():
-    """Muestra estadísticas de la base de datos."""
-    print("\n📊 ESTADÍSTICAS DE LA BASE DE DATOS")
-    print("=" * 60)
-    
-    conn = get_connection()
-    cur = conn.cursor()
-    
-    # Total de chunks
-    cur.execute("SELECT COUNT(*) FROM documents_logs")
-    total_chunks = cur.fetchone()[0]
-    print(f"Total de chunks en BD: {total_chunks}")
-    
-    # Chunks por estado
-    cur.execute("""
-        SELECT estado, COUNT(*) 
-        FROM documents_logs 
-        GROUP BY estado
-    """)
-    for estado, count in cur.fetchall():
-        print(f"  - {estado}: {count}")
-    
-    # Chunks con embedding
-    cur.execute("""
-        SELECT COUNT(*) 
-        FROM documents_logs 
-        WHERE chunk_embedding IS NOT NULL
-    """)
-    con_embedding = cur.fetchone()[0]
-    print(f"Chunks con embedding: {con_embedding}")
-    
-    # Chunks sin embedding
-    sin_embedding = total_chunks - con_embedding
-    print(f"Chunks sin embedding: {sin_embedding}")
-    
-    # Documentos únicos
-    cur.execute("SELECT COUNT(DISTINCT uuid) FROM documents_logs")
-    docs_unicos = cur.fetchone()[0]
-    print(f"Documentos únicos: {docs_unicos}")
-    
-    # Queries únicas
-    cur.execute("SELECT COUNT(*) FROM queries")
-    queries = cur.fetchone()[0]
-    print(f"Queries en tabla queries: {queries}")
-    
-    cur.close()
-    conn.close()
-    print("=" * 60)
-
-
+# ── FAISS de queries ──────────────────────────────────────────────
 def rebuild_queries_faiss():
     """
-    Reconstruye el índice FAISS de queries (QueryShield) desde la tabla queries.
-    Usa el mismo modelo y lógica que query_shield.py._sync_pg_faiss().
+    Reconstruye faiss_queries.bin desde queries.
+    Mapping: [uuid_str, ...]
     """
-    import warnings, logging, os
-    os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-    warnings.filterwarnings('ignore')
-    logging.getLogger('transformers').setLevel(logging.ERROR)
-    logging.getLogger('sentence_transformers').setLevel(logging.ERROR)
+    print("\n  Reconstruyendo FAISS de queries (MiniLM)...")
 
-    from sentence_transformers import SentenceTransformer
-    from pgvector.psycopg import register_vector
-
-    QUERY_INDEX_PATH   = Path("faiss_index.bin")
-    QUERY_MAPPING_PATH = Path("faiss_index.mapping")
-    QUERY_DIM          = 384
-
-    print("\n🔄 Reconstruyendo FAISS de queries (QueryShield)...")
-    print("⚙️  Cargando modelo paraphrase-multilingual-MiniLM-L12-v2...")
-    model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device='cpu')
-    model.tokenizer.model_max_length = 512
-    print("✅ Modelo cargado")
-
-    conn = psycopg.connect(**DB_CONFIG)
-    register_vector(conn)
-    cur = conn.cursor()
+    conn = get_conn()
+    cur  = conn.cursor()
     cur.execute("SELECT uuid, embedding FROM queries ORDER BY fecha_creacion")
     rows = cur.fetchall()
     cur.close(); conn.close()
 
     if not rows:
-        print("⚠️  No hay queries en BD. Índice vacío creado.")
-        index = faiss.IndexHNSWFlat(QUERY_DIM, 32)
+        print("  ⚠️  No hay queries en BD. Creando índice vacío.")
+        index   = faiss.IndexHNSWFlat(FAISS_QUERY_DIM, FAISS_QUERY_HNSW_M)
         mapping = []
     else:
-        print(f"📊 {len(rows)} queries encontradas en BD")
-        index = faiss.IndexHNSWFlat(QUERY_DIM, 32)
+        print(f"  {len(rows)} queries encontradas")
+        index   = faiss.IndexHNSWFlat(FAISS_QUERY_DIM, FAISS_QUERY_HNSW_M)
         mapping = []
         embeddings = []
 
@@ -286,74 +105,63 @@ def rebuild_queries_faiss():
             embeddings.append(emb)
             mapping.append(str(uuid_val))
 
-        index.add(np.stack(embeddings).astype('float32'))
-        print(f"✅ Índice creado: {index.ntotal} vectores")
+        index.add(np.stack(embeddings).astype("float32"))
+        print(f"  ✅ {index.ntotal} vectores indexados")
 
-    # Backup y guardar
-    for path in [QUERY_INDEX_PATH, QUERY_MAPPING_PATH]:
+    _guardar(index, mapping, FAISS_QUERY_PATH, FAISS_QUERY_MAPPING)
+
+
+# ── Guardar con backup ────────────────────────────────────────────
+def _guardar(index, mapping, bin_path, map_path):
+    for path in (bin_path, map_path):
         if path.exists():
-            path.rename(path.with_suffix(path.suffix + ".backup"))
+            bak = path.with_suffix(path.suffix + ".backup")
+            if bak.exists():
+                bak.unlink()
+            path.rename(bak)
 
-    faiss.write_index(index, str(QUERY_INDEX_PATH))
-    with open(QUERY_MAPPING_PATH, "wb") as f:
+    faiss.write_index(index, str(bin_path))
+    with open(map_path, "wb") as f:
         pickle.dump(mapping, f)
 
-    print(f"💾 Guardado: {QUERY_INDEX_PATH} ({index.ntotal} vectores)")
-
-    # Verificar
-    idx2 = faiss.read_index(str(QUERY_INDEX_PATH))
-    with open(QUERY_MAPPING_PATH, "rb") as f:
+    # Verificación
+    idx2 = faiss.read_index(str(bin_path))
+    with open(map_path, "rb") as f:
         map2 = pickle.load(f)
+
     if idx2.ntotal == len(map2):
-        print("✅ Verificación OK: índice y mapping coinciden")
+        print(f"  ✅ Guardado y verificado: {bin_path.name} ({idx2.ntotal} vectores)")
     else:
-        print("⚠️  Índice y mapping no coinciden")
+        print(f"  ⚠️  Índice y mapping no coinciden: {idx2.ntotal} vs {len(map2)}")
 
 
+# ── MAIN ──────────────────────────────────────────────────────────
 def main():
-    """Función principal."""
-    print("🚀 REBUILD FAISS INDEX")
-    print("=" * 60)
+    print("\n" + "="*60)
+    print("REBUILD FAISS INDEX".center(60))
+    print("="*60)
 
-    mostrar_estadisticas()
+    print("\n  ¿Qué índice reconstruir?")
+    print("  1. FAISS documentos  (faiss_docs.bin    — BGE-M3)")
+    print("  2. FAISS queries     (faiss_queries.bin — MiniLM)")
+    print("  3. Ambos")
 
-    count_procesados, count_total = contar_embeddings_disponibles()
-    print(f"\n📈 Embeddings disponibles:")
-    print(f"   - Procesados: {count_procesados}")
-    print(f"   - Total: {count_total}")
+    opcion = input("\n  Selecciona [1/2/3]: ").strip()
+    if opcion not in ("1", "2", "3"):
+        print("  ❌ Opción inválida"); return
 
-    print("\n⚙️  ¿QUÉ ÍNDICE RECONSTRUIR?")
-    print("1. FAISS de chunks/documentos  (DataShield  — faiss_index_bge3)")
-    print("2. FAISS de queries            (QueryShield — faiss_index)")
-    print("3. Ambos")
+    confirm = input("\n  ⚠️  Esto sobrescribirá los archivos. ¿Continuar? [s/N]: ").strip().lower()
+    if confirm != "s":
+        print("  ❌ Cancelado"); return
 
-    opcion_indice = input("\nSelecciona [1/2/3]: ").strip()
-    if opcion_indice not in ("1", "2", "3"):
-        print("❌ Opción inválida"); return
-
-    confirmacion = input("\n⚠️  Esto sobrescribirá los archivos existentes. ¿Continuar? [s/N]: ").strip().lower()
-    if confirmacion != 's':
-        print("❌ Operación cancelada"); return
-
-    # ── FAISS de documentos ───────────────────────────────────────
-    if opcion_indice in ("1", "3"):
-        print("\n⚙️  OPCIONES PARA FAISS DE CHUNKS:")
-        print("1. Solo chunks PROCESADOS (recomendado)")
-        print("2. Todos los chunks con embedding")
-        sub = input("Selecciona [1/2]: ").strip()
-        solo_procesados = sub != "2"
-
-        index, mapping = rebuild_faiss_index(solo_procesados, max_records=None)
-        if index is None:
-            print("❌ No se pudo crear el índice de chunks"); return
-        save_faiss_index(index, mapping, backup=True)
-        verificar_indice()
-
-    # ── FAISS de queries ──────────────────────────────────────────
-    if opcion_indice in ("2", "3"):
+    if opcion in ("1", "3"):
+        rebuild_docs_faiss()
+    if opcion in ("2", "3"):
         rebuild_queries_faiss()
 
-    print("\n✅ RECONSTRUCCIÓN COMPLETADA")
+    print("\n" + "="*60)
+    print("RECONSTRUCCION COMPLETADA".center(60))
+    print("="*60 + "\n")
 
 
 if __name__ == "__main__":
