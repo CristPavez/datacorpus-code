@@ -27,9 +27,9 @@ def _query(sql: str, params=()) -> list[dict]:
 @router.get("/resumen", summary="Resumen general del corpus")
 def resumen():
     rows = _query(
-        "SELECT total_documents, total_queries, documents_aprobados, documents_duplicados, "
-        "documents_omitidos, documents_similares, queries_aprobadas, queries_similares, "
-        "queries_sin_resultados, queries_omitidas, queries_duplicadas "
+        "SELECT total_documents, total_queries, total_uuids_documents_logs, total_uuids_queries_logs, "
+        "documents_aprobados, documents_duplicados, documents_omitidos, documents_similares, "
+        "queries_aprobadas, queries_similares, queries_sin_resultados, queries_omitidas, queries_duplicadas "
         "FROM public.v_resumen_totales"
     )
     return rows[0] if rows else {}

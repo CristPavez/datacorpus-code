@@ -44,14 +44,26 @@ def rebuild_docs_faiss():
     conn = get_conn()
     cur  = conn.cursor()
     cur.execute("""
-        SELECT uuid, chunk_numero, embedding
-        FROM documents_logs
-        WHERE embedding IS NOT NULL
-          AND estado = 'APROBADO'
-        ORDER BY id
+        SELECT dl.uuid, dl.chunk_numero, dl.embedding
+        FROM documents_logs dl
+        INNER JOIN documents d ON d.uuid = dl.uuid
+        WHERE dl.embedding IS NOT NULL
+          AND dl.estado = 'APROBADO'
+        ORDER BY dl.id
     """)
     rows = cur.fetchall()
+
+    # Contar total para informar cuántos huérfanos se omitieron
+    cur.execute("""
+        SELECT COUNT(*) FROM documents_logs
+        WHERE embedding IS NOT NULL AND estado = 'APROBADO'
+    """)
+    total_logs = cur.fetchone()[0]
     cur.close(); conn.close()
+
+    huerfanos = total_logs - len(rows)
+    if huerfanos > 0:
+        print(f"  ⚠️  {huerfanos} chunk(s) huérfano(s) omitidos (documento padre no existe en documents)")
 
     if not rows:
         print("  ⚠️  No hay chunks APROBADO con embedding. Creando índice vacío.")

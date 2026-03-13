@@ -62,6 +62,7 @@ class QueryShield:
         self.model.tokenizer.model_max_length = MODEL_MAX_LENGTH
         self.uuid_mapping: list[str] = []
         self.faiss_index = self._load_or_create_faiss()
+        self._reconciliar_con_bd()          # Issue 7: sincroniza gaps BD↔FAISS
 
     # ── Conexión ──────────────────────────────────────────────────
     def _get_conn(self):
@@ -76,8 +77,66 @@ class QueryShield:
             with open(self.faiss_path.with_suffix('.mapping'), 'rb') as f:
                 self.uuid_mapping = pickle.load(f)
             return index
-        except Exception:
+        except FileNotFoundError:
+            # Primera ejecución — índice vacío, _reconciliar_con_bd() lo poblará si hay datos en BD
             return faiss.IndexHNSWFlat(FAISS_QUERY_DIM, FAISS_QUERY_HNSW_M)
+        except Exception as e:
+            # Issue 8: corrupción detectada — reconstruir desde BD en vez de arrancar vacío
+            print(f"   ❌ FAISS de queries corrupto ({e}) — reconstruyendo desde BD...")
+            return self._rebuild_desde_bd()
+
+    def _rebuild_desde_bd(self):
+        """Reconstruye el índice FAISS de queries completo desde los embeddings en BD."""
+        conn = self._get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT uuid, embedding FROM queries ORDER BY fecha_creacion")
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+
+        index = faiss.IndexHNSWFlat(FAISS_QUERY_DIM, FAISS_QUERY_HNSW_M)
+        self.uuid_mapping = []
+
+        if not rows:
+            print("   ℹ️  Sin queries en BD — índice vacío creado")
+            return index
+
+        embeddings = []
+        for uuid_val, emb_raw in rows:
+            emb = np.array(emb_raw, dtype=np.float32).flatten()
+            faiss.normalize_L2(emb.reshape(1, -1))
+            embeddings.append(emb)
+            self.uuid_mapping.append(str(uuid_val))
+
+        index.add(np.stack(embeddings).astype('float32'))
+        faiss.write_index(index, str(self.faiss_path))
+        with open(self.faiss_path.with_suffix('.mapping'), 'wb') as f:
+            pickle.dump(self.uuid_mapping, f)
+        print(f"   ✅ Índice reconstruido: {index.ntotal} queries")
+        return index
+
+    def _reconciliar_con_bd(self):
+        """Issue 7: detecta UUIDs en BD que falten en FAISS por crash y los agrega."""
+        conn = self._get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT uuid, embedding FROM queries ORDER BY fecha_creacion")
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+
+        uuids_faiss = set(self.uuid_mapping)
+        faltantes   = [(str(u), e) for u, e in rows if str(u) not in uuids_faiss]
+
+        if not faltantes:
+            return
+
+        print(f"   ⚠️  {len(faltantes)} query(s) en BD sin entrada en FAISS — reconciliando...")
+        for uuid_val, emb_raw in faltantes:
+            emb = np.array(emb_raw, dtype=np.float32).flatten()
+            faiss.normalize_L2(emb.reshape(1, -1))
+            self.faiss_index.add(emb.reshape(1, -1).astype('float32'))
+            self.uuid_mapping.append(uuid_val)
+
+        self._save_faiss()
+        print(f"   ✅ Reconciliación completada: {len(faltantes)} query(s) agregada(s)")
 
     def _save_faiss(self):
         faiss.write_index(self.faiss_index, str(self.faiss_path))

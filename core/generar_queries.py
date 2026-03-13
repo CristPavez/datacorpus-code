@@ -18,6 +18,7 @@ logging.getLogger('sentence_transformers').setLevel(logging.ERROR)
 
 import json
 import uuid
+import time
 import random
 import psycopg
 from typing import Optional
@@ -28,6 +29,24 @@ from .config import (DB_CONFIG, TOGETHER_API_KEY, TEMAS_VALIDOS,
 
 # ── Configuración ────────────────────────────────────────────────
 QUERIES_POR_TEMA = 1
+
+# ── Retry LLM ────────────────────────────────────────────────────
+_RETRY_CODES    = {429, 500, 502, 503, 504}
+_MAX_REINTENTOS = 3
+
+def _llamar_llm(crear_completion):
+    """Ejecuta crear_completion() con backoff exponencial en errores transitorios (429/5xx)."""
+    for intento in range(_MAX_REINTENTOS):
+        try:
+            return crear_completion()
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            if status in _RETRY_CODES and intento < _MAX_REINTENTOS - 1:
+                espera = 2 ** (intento + 1)
+                print(f"      ⚠️  LLM error {status} — reintentando en {espera}s ({intento + 1}/{_MAX_REINTENTOS - 1})...")
+                time.sleep(espera)
+            else:
+                raise
 
 
 # ── Cliente LLM ──────────────────────────────────────────────────
@@ -81,7 +100,7 @@ def generar_preguntas_lm(tema: str, n: int) -> list[str]:
         f"Genera {n} preguntas sobre {tema}:"
     )
 
-    response = get_llm_client().chat.completions.create(
+    response = _llamar_llm(lambda: get_llm_client().chat.completions.create(
         model="deepseek-ai/DeepSeek-V3",
         messages=[
             {"role": "system", "content": prompt_sistema},
@@ -89,7 +108,7 @@ def generar_preguntas_lm(tema: str, n: int) -> list[str]:
         ],
         max_tokens=1000,
         temperature=0.8,
-    )
+    ))
 
     texto = response.choices[0].message.content.strip()
     lineas = []
@@ -117,12 +136,12 @@ def decidir_agente(query_nueva: str, query_historica: str) -> bool:
         f"Responde SOLO con: DIFERENTES o SIMILARES"
     )
     try:
-        response = get_llm_client().chat.completions.create(
+        response = _llamar_llm(lambda: get_llm_client().chat.completions.create(
             model="deepseek-ai/DeepSeek-V3",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=50,
             temperature=0.3,
-        )
+        ))
         decision = response.choices[0].message.content.strip().upper()
         if "DIFERENTES" in decision: return True
         if "SIMILARES"  in decision: return False

@@ -73,6 +73,7 @@ class DataShield:
         self.model   = SentenceTransformer(MODEL_DOCS, device='cpu')
         self.model.tokenizer.model_max_length = MODEL_MAX_LENGTH
         self.faiss_index = self._load_faiss()
+        self._reconciliar_con_bd()          # Issue 7: sincroniza gaps BD↔FAISS
 
     # ── Conexión ──────────────────────────────────────────────────
     def _get_conn(self):
@@ -87,9 +88,84 @@ class DataShield:
             with open(self.faiss_path.with_suffix('.mapping'), 'rb') as f:
                 self.mapping = pickle.load(f)
             return idx
-        except Exception:
+        except FileNotFoundError:
+            # Primera ejecución — índice vacío, _reconciliar_con_bd() lo poblará si hay datos en BD
             self.mapping = []
             return faiss.IndexHNSWFlat(FAISS_DOCS_DIM, FAISS_DOCS_HNSW_M)
+        except Exception as e:
+            # Issue 8: corrupción detectada — reconstruir desde BD en vez de arrancar vacío
+            print(f"   ❌ FAISS de documentos corrupto ({e}) — reconstruyendo desde BD...")
+            return self._rebuild_desde_bd()
+
+    def _rebuild_desde_bd(self):
+        """Reconstruye el índice FAISS de documentos completo desde los embeddings en BD."""
+        conn = self._get_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT dl.uuid, dl.chunk_numero, dl.embedding
+            FROM documents_logs dl
+            INNER JOIN documents d ON d.uuid = dl.uuid
+            WHERE dl.embedding IS NOT NULL
+              AND dl.estado = 'APROBADO'
+            ORDER BY dl.id
+        """)
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+
+        index = faiss.IndexHNSWFlat(FAISS_DOCS_DIM, FAISS_DOCS_HNSW_M)
+        self.mapping = []
+
+        if not rows:
+            print("   ℹ️  Sin chunks aprobados en BD — índice vacío creado")
+            return index
+
+        embeddings = []
+        for uuid_val, chunk_num, emb_raw in rows:
+            emb = np.array(emb_raw, dtype=np.float32).flatten()
+            faiss.normalize_L2(emb.reshape(1, -1))
+            embeddings.append(emb)
+            self.mapping.append((str(uuid_val), int(chunk_num)))
+
+        index.add(np.stack(embeddings).astype('float32'))
+        faiss.write_index(index, str(self.faiss_path))
+        with open(self.faiss_path.with_suffix('.mapping'), 'wb') as f:
+            pickle.dump(self.mapping, f)
+        print(f"   ✅ Índice reconstruido: {index.ntotal} chunks")
+        return index
+
+    def _reconciliar_con_bd(self):
+        """Issue 7: detecta chunks en BD que falten en FAISS por crash y los agrega."""
+        conn = self._get_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT dl.uuid, dl.chunk_numero, dl.embedding
+            FROM documents_logs dl
+            INNER JOIN documents d ON d.uuid = dl.uuid
+            WHERE dl.embedding IS NOT NULL
+              AND dl.estado = 'APROBADO'
+            ORDER BY dl.id
+        """)
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+
+        claves_faiss = set(self.mapping)
+        faltantes    = [
+            (str(u), int(n), e) for u, n, e in rows
+            if (str(u), int(n)) not in claves_faiss
+        ]
+
+        if not faltantes:
+            return
+
+        print(f"   ⚠️  {len(faltantes)} chunk(s) en BD sin entrada en FAISS — reconciliando...")
+        for uuid_val, chunk_num, emb_raw in faltantes:
+            emb = np.array(emb_raw, dtype=np.float32).flatten()
+            faiss.normalize_L2(emb.reshape(1, -1))
+            self.faiss_index.add(emb.reshape(1, -1).astype('float32'))
+            self.mapping.append((uuid_val, chunk_num))
+
+        self._save_faiss()
+        print(f"   ✅ Reconciliación completada: {len(faltantes)} chunk(s) agregado(s)")
 
     def _save_faiss(self):
         faiss.write_index(self.faiss_index, str(self.faiss_path))

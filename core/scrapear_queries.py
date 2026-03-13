@@ -27,6 +27,25 @@ from .query_shield import QueryShield
 from .config import DB_CONFIG, BRAVE_API_KEY, TOGETHER_API_KEY, QUERIES_FILE
 
 
+# ── Retry LLM ────────────────────────────────────────────────────
+_RETRY_CODES    = {429, 500, 502, 503, 504}
+_MAX_REINTENTOS = 3
+
+def _llamar_llm(crear_completion):
+    """Ejecuta crear_completion() con backoff exponencial en errores transitorios (429/5xx)."""
+    for intento in range(_MAX_REINTENTOS):
+        try:
+            return crear_completion()
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            if status in _RETRY_CODES and intento < _MAX_REINTENTOS - 1:
+                espera = 2 ** (intento + 1)
+                print(f"      ⚠️  LLM error {status} — reintentando en {espera}s ({intento + 1}/{_MAX_REINTENTOS - 1})...")
+                time.sleep(espera)
+            else:
+                raise
+
+
 # ── Cliente LLM ──────────────────────────────────────────────────
 def get_llm_client() -> OpenAI:
     return OpenAI(api_key=TOGETHER_API_KEY, base_url="https://api.together.xyz/v1")
@@ -105,7 +124,7 @@ def decidir_chunk_llm(chunk_nuevo: str, chunk_existente: str) -> bool:
             "que no esté en el 'Texto Existente'?\n"
             "Responde únicamente: 'NUEVO' si aporta algo diferente, o 'DUPLICADO' si es redundante."
         )
-        resp = get_llm_client().chat.completions.create(
+        resp = _llamar_llm(lambda: get_llm_client().chat.completions.create(
             model="deepseek-ai/DeepSeek-V3",
             messages=[
                 {"role": "system", "content": prompt_sistema},
@@ -113,12 +132,12 @@ def decidir_chunk_llm(chunk_nuevo: str, chunk_existente: str) -> bool:
             ],
             max_tokens=10,
             temperature=0.0,
-        )
+        ))
         resultado = resp.choices[0].message.content.strip().upper()
         return "NUEVO" in resultado
     except Exception as e:
-        print(f"      ⚠️  Error LLM chunk: {e} — conservando (APROBADO)")
-        return True  # Conservador: no perder datos por fallo de API
+        print(f"      ⚠️  Error LLM chunk: {e} — descartando (SIMILAR)")
+        return False  # Conservador: chunk en zona 0.90-1.0 ya es sospechoso; si el LLM no puede confirmar, rechazar
 
 
 # ── Procesamiento de chunks con umbral 50% ────────────────────────

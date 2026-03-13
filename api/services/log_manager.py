@@ -9,6 +9,20 @@ from datetime import datetime
 from typing import Optional
 
 
+# Patrones de ruido de librerías externas que no deben llegar al WebSocket.
+# Aplica a: tqdm (progress bars), Python warnings, sentence_transformers, trafilatura.
+_NOISE_PATTERNS = (
+    "%|",               # barra de progreso tqdm
+    "it/s",             # velocidad tqdm
+    "B/s",              # velocidad tqdm (bytes)
+    "UserWarning",
+    "DeprecationWarning",
+    "FutureWarning",
+    "RuntimeWarning",
+    "warnings.warn",
+)
+
+
 class _CaptureStream:
     """Reemplaza sys.stdout para interceptar print()."""
 
@@ -22,11 +36,16 @@ class _CaptureStream:
         self._buf += text
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            if line.strip():
+            if line.strip() and not _es_ruido_externo(line):
                 self._mgr._broadcast(line)
 
     def flush(self):
         self._orig.flush()
+
+
+def _es_ruido_externo(line: str) -> bool:
+    """Devuelve True si la línea parece output de una librería externa."""
+    return any(p in line for p in _NOISE_PATTERNS)
 
 
 class LogManager:
